@@ -1,0 +1,57 @@
+[project]
+name = "hermes-sdd"
+version = "0.1.0"
+description = "Adaptive, context-efficient spec-driven development for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+authors = [{ name = "Hermes SDD contributors" }]
+keywords = ["hermes-agent", "spec-driven-development", "sdd", "ai-agent", "planning"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/mindwired/hermess-sdd"
+Repository = "https://github.com/mindwired/hermess-sdd"
+Issues = "https://github.com/mindwired/hermess-sdd/issues"
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = []
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["dashboard/dist", "desktop"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.coverage.run]
+branch = true
+source = ["hermes_sdd"]
+omit = ["hermes_sdd/dashboard_api.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 85

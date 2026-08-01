@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose a result-improving capability
+title: "[feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What implementation, recovery, coordination, or verification problem exists?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+    validations:
+      required: true
+  - type: textarea
+    id: overhead
+    attributes:
+      label: Process and token overhead
+      description: Why is the expected quality gain worth the additional surface or ceremony?
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and migration considerations

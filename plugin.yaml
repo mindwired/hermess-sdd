@@ -1,0 +1,9 @@
+manifest_version: 1
+name: sdd
+version: 0.1.0
+description: Adaptive, durable, context-efficient spec-driven development for Hermes
+kind: standalone
+author: Hermes SDD contributors
+provides_tools:
+  - sdd
+provides_hooks: []

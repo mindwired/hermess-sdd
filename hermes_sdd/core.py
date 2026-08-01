@@ -1,0 +1,1675 @@
+"""Authoritative service layer for adaptive spec-driven development."""
+
+from __future__ import annotations
+
+import json
+import re
+import uuid
+from collections import Counter, defaultdict, deque
+from pathlib import Path
+from typing import Any, Iterable
+
+from .context_pack import build_context_pack, checkpoint_delta, create_checkpoint
+from .registry import SourceRegistry
+from .render import render_all, render_decision_index
+from .storage import (
+    append_jsonl,
+    atomic_write_json,
+    atomic_write_text,
+    project_lock,
+    read_json,
+    read_jsonl,
+    resolve_root,
+    utc_now,
+    validate_id,
+)
+
+_MODES = {"auto", "quick", "standard", "deep", "program"}
+_TASK_STATES = {"pending", "in_progress", "blocked", "done", "skipped"}
+_RISKS = {"low", "medium", "high", "critical"}
+_MILESTONE_STATES = {"planned", "ready", "in_progress", "blocked", "done", "verified", "cancelled"}
+
+
+def _list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _compact(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _compact(item) for key, item in value.items() if item not in (None, "", [], {})
+        }
+    if isinstance(value, list):
+        return [_compact(item) for item in value]
+    return value
+
+
+def _next_numeric_id(existing: Iterable[str], prefix: str, width: int = 3) -> str:
+    pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+    numbers = [int(match.group(1)) for value in existing if (match := pattern.match(str(value)))]
+    return f"{prefix}{max(numbers, default=0) + 1:0{width}d}"
+
+
+def complexity_mode(signals: dict[str, Any] | None) -> tuple[str, int]:
+    signals = signals or {}
+    dimensions = ("novelty", "ambiguity", "surface_area", "risk", "duration", "coordination")
+    score = 0
+    for key in dimensions:
+        try:
+            score += max(0, min(3, int(signals.get(key, 1))))
+        except (TypeError, ValueError):
+            score += 1
+    if score <= 4:
+        return "quick", score
+    if score <= 8:
+        return "standard", score
+    if score <= 13:
+        return "deep", score
+    return "program", score
+
+
+def _path_overlap(left: str, right: str) -> bool:
+    left = left.strip().strip("/")
+    right = right.strip().strip("/")
+    if not left or not right:
+        return True
+    if any(char in left for char in "*?[") or any(char in right for char in "*?["):
+        left_base = re.split(r"[\*\?\[]", left, maxsplit=1)[0].rstrip("/")
+        right_base = re.split(r"[\*\?\[]", right, maxsplit=1)[0].rstrip("/")
+        if not left_base or not right_base:
+            return True
+        left, right = left_base, right_base
+    return left == right or left.startswith(right + "/") or right.startswith(left + "/")
+
+
+def _tasks_conflict(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_scope = _list(left.get("file_scope"))
+    right_scope = _list(right.get("file_scope"))
+    if not left_scope or not right_scope:
+        return True
+    return any(_path_overlap(str(a), str(b)) for a in left_scope for b in right_scope)
+
+
+def _validate_dag(tasks: list[dict[str, Any]]) -> list[str]:
+    ids = {str(task.get("id")) for task in tasks}
+    errors: list[str] = []
+    graph: dict[str, list[str]] = defaultdict(list)
+    indegree: dict[str, int] = {task_id: 0 for task_id in ids}
+    for task in tasks:
+        task_id = str(task.get("id"))
+        for dep in _list(task.get("depends_on")):
+            dep = str(dep)
+            if dep not in ids:
+                errors.append(f"{task_id} depends on unknown task {dep}")
+                continue
+            graph[dep].append(task_id)
+            indegree[task_id] += 1
+    queue = deque(task_id for task_id, degree in indegree.items() if degree == 0)
+    seen = 0
+    while queue:
+        node = queue.popleft()
+        seen += 1
+        for child in graph[node]:
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                queue.append(child)
+    if seen != len(ids):
+        errors.append("Task dependency graph contains a cycle")
+    return errors
+
+
+class SDDService:
+    schema_version = 1
+
+    def __init__(self, registry: SourceRegistry | None = None) -> None:
+        self._registry = registry
+
+    @property
+    def registry(self) -> SourceRegistry:
+        """Create the optional visual-source registry only when first used."""
+        if self._registry is None:
+            self._registry = SourceRegistry()
+        return self._registry
+
+    def _root(self, root: str | None, *, create: bool = False) -> Path:
+        return resolve_root(root, create=create)
+
+    @staticmethod
+    def _sdd(root: Path) -> Path:
+        return root / ".sdd"
+
+    def _require(self, root: Path) -> Path:
+        sdd = self._sdd(root)
+        if sdd.is_symlink():
+            raise ValueError(f"Refusing symlinked SDD directory: {sdd}")
+        if not (sdd / "project.json").exists():
+            raise ValueError(f"No SDD project at {root}; run operation=init first")
+        for name in ("milestones", "decisions", "checkpoints", ".locks", "cache"):
+            if (sdd / name).is_symlink():
+                raise ValueError(f"Refusing symlinked SDD subdirectory: {sdd / name}")
+        return sdd
+
+    @staticmethod
+    def _event(sdd: Path, kind: str, **data: Any) -> None:
+        append_jsonl(sdd / "events.jsonl", {"at": utc_now(), "kind": kind, **_compact(data)})
+
+    def init(
+        self, root: str | None, payload: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root, create=True)
+        sdd = self._sdd(project_root)
+        backup_path = None
+        if sdd.is_symlink() and not options.get("force"):
+            raise ValueError(
+                f"Refusing symlinked SDD directory: {sdd}; use force only to replace the link"
+            )
+        if (sdd / "project.json").exists() and not options.get("force"):
+            return {"ok": True, "created": False, "status": self.status(str(project_root), {}, {})}
+        if (sdd.exists() or sdd.is_symlink()) and options.get("force"):
+            stamp = utc_now().replace("+00:00", "Z").replace(":", "").replace("T", "-")
+            backup = project_root / f".sdd.backup-{stamp}-{uuid.uuid4().hex[:6]}"
+            sdd.rename(backup)
+            backup_path = str(backup)
+
+        requested_mode = str(payload.get("mode") or "auto").lower()
+        if requested_mode not in _MODES:
+            raise ValueError(f"Invalid mode {requested_mode!r}; choose one of {sorted(_MODES)}")
+        resolved_mode, score = complexity_mode(payload.get("signals"))
+        mode = resolved_mode if requested_mode == "auto" else requested_mode
+        now = utc_now()
+        project = {
+            "schema_version": self.schema_version,
+            "name": payload.get("name") or project_root.name,
+            "goal": payload.get("goal") or "",
+            "summary": payload.get("summary") or "",
+            "mode": mode,
+            "complexity_score": score,
+            "success_criteria": _list(payload.get("success_criteria")),
+            "constraints": _list(payload.get("constraints")),
+            "non_goals": _list(payload.get("non_goals")),
+            "principles": _list(payload.get("principles")),
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+        }
+        evidence_policy = payload.get("require_evidence", "risk_based")
+        if evidence_policy not in {"never", "risk_based", "always"}:
+            raise ValueError("require_evidence must be never, risk_based, or always")
+        config = {
+            "schema_version": self.schema_version,
+            "mode": mode,
+            "max_parallel": max(1, min(12, int(payload.get("max_parallel") or 4))),
+            "context_budget_tokens": max(
+                2000, min(80000, int(payload.get("context_budget_tokens") or 12000))
+            ),
+            "require_evidence": evidence_policy,
+            "strict": bool(payload.get("strict", False)),
+            "include_git_summary": bool(payload.get("include_git_summary", True)),
+            "max_artifact_chars": max(8000, int(payload.get("max_artifact_chars") or 50000)),
+        }
+        state = {
+            "schema_version": self.schema_version,
+            "status": "planning" if mode != "quick" else "active",
+            "active_milestone": None,
+            "current_tasks": [],
+            "last_checkpoint": None,
+            "updated_at": now,
+        }
+        sdd.mkdir(parents=True, exist_ok=True)
+        for directory in ("milestones", "decisions", "checkpoints", "research", ".locks", "cache"):
+            (sdd / directory).mkdir(parents=True, exist_ok=True)
+        atomic_write_text(sdd / ".gitignore", ".locks/\ncache/\n")
+        atomic_write_json(sdd / "project.json", project)
+        atomic_write_json(sdd / "config.json", config)
+        atomic_write_json(sdd / "state.json", state)
+        atomic_write_json(sdd / "requirements.json", {"schema_version": 1, "requirements": []})
+        atomic_write_json(sdd / "roadmap.json", {"schema_version": 1, "milestones": []})
+        atomic_write_text(sdd / "architecture.md", "# Architecture\n\nNot established yet.\n")
+        atomic_write_text(sdd / "events.jsonl", "")
+        self._event(sdd, "project_initialized", mode=mode, complexity_score=score)
+        render_all(project_root)
+        render_decision_index(project_root)
+        source = self.registry.register(str(project_root), str(project.get("name")))
+        return {
+            "ok": True,
+            "created": True,
+            "root": str(project_root),
+            "mode": mode,
+            "complexity_score": score,
+            "source": source,
+            "backup": backup_path,
+            "next": "Capture goals/requirements, then create a milestone and plan only the first meaningful slice.",
+        }
+
+    def configure(
+        self, root: str | None, payload: dict[str, Any], _: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        allowed = {
+            "mode",
+            "max_parallel",
+            "context_budget_tokens",
+            "require_evidence",
+            "strict",
+            "include_git_summary",
+            "max_artifact_chars",
+        }
+        updates = {key: value for key, value in payload.items() if key in allowed}
+        if "mode" in updates and updates["mode"] not in _MODES - {"auto"}:
+            raise ValueError("Configured mode must be quick, standard, deep, or program")
+        if "max_parallel" in updates:
+            updates["max_parallel"] = max(1, min(12, int(updates["max_parallel"])))
+        if "context_budget_tokens" in updates:
+            updates["context_budget_tokens"] = max(
+                2000, min(80000, int(updates["context_budget_tokens"]))
+            )
+        if "require_evidence" in updates and updates["require_evidence"] not in {
+            "never",
+            "risk_based",
+            "always",
+        }:
+            raise ValueError("require_evidence must be never, risk_based, or always")
+        with project_lock(sdd):
+            config = read_json(sdd / "config.json", {}) or {}
+            config.update(updates)
+            config["updated_at"] = utc_now()
+            atomic_write_json(sdd / "config.json", config)
+            if "mode" in updates:
+                project = read_json(sdd / "project.json", {}) or {}
+                project["mode"] = updates["mode"]
+                project["updated_at"] = utc_now()
+                atomic_write_json(sdd / "project.json", project)
+            self._event(sdd, "configuration_updated", updates=updates)
+            render_all(project_root)
+        return {"ok": True, "config": config}
+
+    def upsert_spec(
+        self, root: str | None, payload: dict[str, Any], _: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        with project_lock(sdd):
+            project = read_json(sdd / "project.json", {}) or {}
+            for key in (
+                "name",
+                "goal",
+                "summary",
+                "success_criteria",
+                "constraints",
+                "non_goals",
+                "principles",
+                "status",
+            ):
+                if key in payload:
+                    project[key] = (
+                        _list(payload[key])
+                        if key in {"success_criteria", "constraints", "non_goals", "principles"}
+                        else payload[key]
+                    )
+            project["updated_at"] = utc_now()
+            atomic_write_json(sdd / "project.json", project)
+
+            requirements_doc = read_json(sdd / "requirements.json", {"requirements": []}) or {
+                "requirements": []
+            }
+            existing = {item.get("id"): item for item in requirements_doc.get("requirements", [])}
+            existing_ids = [key for key in existing if key]
+            changed: list[str] = []
+            for raw in _list(payload.get("requirements")):
+                if not isinstance(raw, dict):
+                    continue
+                req_id = raw.get("id") or _next_numeric_id(existing_ids, "REQ-", 3)
+                req_id = validate_id(req_id, "requirement id")
+                item = existing.get(req_id, {"id": req_id, "created_at": utc_now()})
+                item.update(
+                    {
+                        "title": raw.get("title") or item.get("title") or req_id,
+                        "statement": raw.get("statement") or item.get("statement") or "",
+                        "priority": raw.get("priority") or item.get("priority") or "must",
+                        "acceptance": _list(raw.get("acceptance", item.get("acceptance", []))),
+                        "status": raw.get("status") or item.get("status") or "active",
+                        "source": raw.get("source") or item.get("source") or "user",
+                        "updated_at": utc_now(),
+                    }
+                )
+                existing[req_id] = item
+                existing_ids.append(req_id)
+                changed.append(req_id)
+            requirements_doc["requirements"] = sorted(
+                existing.values(), key=lambda item: item.get("id", "")
+            )
+            atomic_write_json(sdd / "requirements.json", requirements_doc)
+
+            if "architecture" in payload:
+                architecture = str(payload.get("architecture") or "").strip()
+                atomic_write_text(sdd / "architecture.md", architecture.rstrip() + "\n")
+            self._event(
+                sdd,
+                "spec_updated",
+                requirements=changed,
+                project_fields=[key for key in payload if key != "requirements"],
+            )
+            render_all(project_root)
+        return {"ok": True, "requirements_updated": changed, "project": _compact(project)}
+
+    def create_milestone(
+        self, root: str | None, payload: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        with project_lock(sdd):
+            roadmap = read_json(sdd / "roadmap.json", {"milestones": []}) or {"milestones": []}
+            milestones = roadmap.get("milestones", [])
+            milestone_id = validate_id(
+                payload.get("id")
+                or _next_numeric_id([m.get("id", "") for m in milestones], "M", 3),
+                "milestone id",
+            )
+            if any(item.get("id") == milestone_id for item in milestones):
+                raise ValueError(f"Milestone already exists: {milestone_id}")
+            milestone_status = payload.get("status") or "planned"
+            if milestone_status not in _MILESTONE_STATES:
+                raise ValueError(f"Invalid milestone status: {milestone_status}")
+            milestone = {
+                "id": milestone_id,
+                "title": payload.get("title") or milestone_id,
+                "objective": payload.get("objective") or "",
+                "status": milestone_status,
+                "risk": payload.get("risk") if payload.get("risk") in _RISKS else "medium",
+                "requirement_ids": _list(payload.get("requirement_ids")),
+                "decision_ids": _list(payload.get("decision_ids")),
+                "exit_criteria": _list(payload.get("exit_criteria")),
+                "interfaces_stable": bool(payload.get("interfaces_stable", False)),
+                "created_at": utc_now(),
+                "updated_at": utc_now(),
+            }
+            milestones.append(milestone)
+            roadmap["milestones"] = milestones
+            atomic_write_json(sdd / "roadmap.json", roadmap)
+            milestone_dir = sdd / "milestones" / milestone_id
+            milestone_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(milestone_dir / "milestone.json", milestone)
+            atomic_write_json(
+                milestone_dir / "plan.json",
+                {"schema_version": 1, "milestone_id": milestone_id, "revision": 0, "tasks": []},
+            )
+            atomic_write_text(
+                milestone_dir / "context.md",
+                str(payload.get("context") or "# Milestone context\n\nNot recorded yet.\n").rstrip()
+                + "\n",
+            )
+            atomic_write_text(milestone_dir / "evidence.jsonl", "")
+            atomic_write_text(
+                milestone_dir / "summary.md", "# Milestone summary\n\nNot completed yet.\n"
+            )
+            project = read_json(sdd / "project.json", {}) or {}
+            if project.get("status") == "complete":
+                project["status"] = "active"
+                project["updated_at"] = utc_now()
+                atomic_write_json(sdd / "project.json", project)
+            state = read_json(sdd / "state.json", {}) or {}
+            if options.get("activate") is True or not state.get("active_milestone"):
+                state["active_milestone"] = milestone_id
+                state["status"] = "planning"
+                state["updated_at"] = utc_now()
+                atomic_write_json(sdd / "state.json", state)
+            self._event(sdd, "milestone_created", milestone_id=milestone_id)
+            render_all(project_root)
+        return {"ok": True, "milestone": milestone}
+
+    def update_milestone(
+        self, root: str | None, target: str | None, payload: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        scalar_fields = {"title", "objective", "status", "risk", "interfaces_stable"}
+        list_fields = {"requirement_ids", "decision_ids", "exit_criteria"}
+        with project_lock(sdd):
+            milestone_id, milestone_dir, milestone, _ = self._milestone(
+                sdd, target or payload.get("milestone_id")
+            )
+            for key in scalar_fields:
+                if key in payload:
+                    value = payload[key]
+                    if key == "risk" and value not in _RISKS:
+                        raise ValueError(f"Invalid milestone risk: {value}")
+                    if key == "status" and value not in _MILESTONE_STATES:
+                        raise ValueError(f"Invalid milestone status: {value}")
+                    milestone[key] = bool(value) if key == "interfaces_stable" else value
+            for key in list_fields:
+                if key in payload:
+                    milestone[key] = _list(payload[key])
+            milestone["updated_at"] = utc_now()
+            atomic_write_json(milestone_dir / "milestone.json", milestone)
+            if "context" in payload:
+                atomic_write_text(
+                    milestone_dir / "context.md", str(payload.get("context") or "").rstrip() + "\n"
+                )
+            self._sync_roadmap_milestone(sdd, milestone)
+            if options.get("activate"):
+                state = read_json(sdd / "state.json", {}) or {}
+                state["active_milestone"] = milestone_id
+                state["status"] = (
+                    "planning"
+                    if milestone.get("status") == "planned"
+                    else milestone.get("status", "active")
+                )
+                state["updated_at"] = utc_now()
+                atomic_write_json(sdd / "state.json", state)
+            self._event(sdd, "milestone_updated", milestone_id=milestone_id, fields=sorted(payload))
+            render_all(project_root)
+        return {"ok": True, "milestone": milestone}
+
+    def _milestone(
+        self, sdd: Path, milestone_id: str | None
+    ) -> tuple[str, Path, dict[str, Any], dict[str, Any]]:
+        state = read_json(sdd / "state.json", {}) or {}
+        milestone_id = validate_id(
+            milestone_id or state.get("active_milestone") or "", "milestone id"
+        )
+        milestone_dir = sdd / "milestones" / milestone_id
+        milestone = read_json(milestone_dir / "milestone.json")
+        if not milestone:
+            raise ValueError(f"Unknown milestone: {milestone_id}")
+        plan = read_json(milestone_dir / "plan.json", {"tasks": []}) or {"tasks": []}
+        return milestone_id, milestone_dir, milestone, plan
+
+    def set_plan(
+        self, root: str | None, payload: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        raw_tasks = _list(payload.get("tasks"))
+        if not raw_tasks:
+            raise ValueError("set_plan requires payload.tasks")
+        with project_lock(sdd):
+            milestone_id, milestone_dir, milestone, old_plan = self._milestone(
+                sdd, payload.get("milestone_id")
+            )
+            if any(
+                task.get("status") == "in_progress" for task in old_plan.get("tasks", [])
+            ) and not options.get("force"):
+                raise ValueError(
+                    "Cannot replace a plan while tasks are in progress; reconcile them or use options.force"
+                )
+            existing_by_id = {task.get("id"): task for task in old_plan.get("tasks", [])}
+            tasks: list[dict[str, Any]] = []
+            ids: list[str] = []
+            for index, raw in enumerate(raw_tasks, start=1):
+                if not isinstance(raw, dict):
+                    raise ValueError(f"Task {index} is not an object")
+                task_id = validate_id(raw.get("id") or f"{milestone_id}-T{index:03d}", "task id")
+                if task_id in ids:
+                    raise ValueError(f"Duplicate task id: {task_id}")
+                ids.append(task_id)
+                previous = existing_by_id.get(task_id, {})
+                status = raw.get("status") or previous.get("status") or "pending"
+                if status not in _TASK_STATES:
+                    raise ValueError(f"Invalid status for {task_id}: {status}")
+                risk = raw.get("risk") or previous.get("risk") or "medium"
+                if risk not in _RISKS:
+                    risk = "medium"
+                task = {
+                    "id": task_id,
+                    "milestone_id": milestone_id,
+                    "title": raw.get("title") or previous.get("title") or task_id,
+                    "objective": raw.get("objective") or previous.get("objective") or "",
+                    "status": status,
+                    "priority": raw.get("priority") or previous.get("priority") or "normal",
+                    "risk": risk,
+                    "kind": raw.get("kind") or previous.get("kind") or "implementation",
+                    "depends_on": _list(raw.get("depends_on", previous.get("depends_on", []))),
+                    "acceptance": _list(raw.get("acceptance", previous.get("acceptance", []))),
+                    "file_scope": _list(raw.get("file_scope", previous.get("file_scope", []))),
+                    "requirement_ids": _list(
+                        raw.get("requirement_ids", previous.get("requirement_ids", []))
+                    ),
+                    "decision_ids": _list(
+                        raw.get("decision_ids", previous.get("decision_ids", []))
+                    ),
+                    "agent_role": raw.get("agent_role") or previous.get("agent_role") or "builder",
+                    "notes": raw.get("notes") or previous.get("notes") or "",
+                    "summary": previous.get("summary") or "",
+                    "evidence_ids": previous.get("evidence_ids", []),
+                    "created_at": previous.get("created_at") or utc_now(),
+                    "updated_at": utc_now(),
+                }
+                tasks.append(task)
+            dag_errors = _validate_dag(tasks)
+            if dag_errors:
+                raise ValueError("; ".join(dag_errors))
+            plan = {
+                "schema_version": 1,
+                "milestone_id": milestone_id,
+                "revision": int(old_plan.get("revision") or 0) + 1,
+                "strategy": payload.get("strategy") or "dependency_and_conflict_safe",
+                "planning_notes": payload.get("planning_notes") or "",
+                "tasks": tasks,
+                "updated_at": utc_now(),
+            }
+            atomic_write_json(milestone_dir / "plan.json", plan)
+            if "context" in payload:
+                atomic_write_text(
+                    milestone_dir / "context.md", str(payload.get("context") or "").rstrip() + "\n"
+                )
+            milestone["status"] = "ready"
+            milestone["updated_at"] = utc_now()
+            atomic_write_json(milestone_dir / "milestone.json", milestone)
+            self._sync_roadmap_milestone(sdd, milestone)
+            state = read_json(sdd / "state.json", {}) or {}
+            state.update(
+                {"active_milestone": milestone_id, "status": "ready", "updated_at": utc_now()}
+            )
+            atomic_write_json(sdd / "state.json", state)
+            self._event(
+                sdd,
+                "plan_saved",
+                milestone_id=milestone_id,
+                task_count=len(tasks),
+                revision=plan["revision"],
+            )
+            render_all(project_root)
+        return {
+            "ok": True,
+            "milestone_id": milestone_id,
+            "revision": plan["revision"],
+            "task_count": len(tasks),
+            "next": self.next(str(project_root), milestone_id, {}, {"limit": 4}),
+        }
+
+    @staticmethod
+    def _sync_roadmap_milestone(sdd: Path, milestone: dict[str, Any]) -> None:
+        roadmap = read_json(sdd / "roadmap.json", {"milestones": []}) or {"milestones": []}
+        roadmap["milestones"] = [
+            milestone if item.get("id") == milestone.get("id") else item
+            for item in roadmap.get("milestones", [])
+        ]
+        atomic_write_json(sdd / "roadmap.json", roadmap)
+
+    @staticmethod
+    def _ready_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        done = {task.get("id") for task in tasks if task.get("status") in {"done", "skipped"}}
+        return [
+            task
+            for task in tasks
+            if task.get("status") == "pending"
+            and all(dep in done for dep in _list(task.get("depends_on")))
+        ]
+
+    def next(
+        self, root: str | None, target: str | None, payload: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        milestone_id, _, milestone, plan = self._milestone(
+            sdd, payload.get("milestone_id") or target
+        )
+        all_tasks = plan.get("tasks", [])
+        ready = sorted(
+            self._ready_tasks(all_tasks),
+            key=lambda task: (task.get("priority") != "high", task.get("id")),
+        )
+        active = [task for task in all_tasks if task.get("status") == "in_progress"]
+        config = read_json(sdd / "config.json", {}) or {}
+        limit = max(1, min(int(options.get("limit") or config.get("max_parallel") or 4), 12))
+        allow_parallel = bool(options.get("allow_parallel", True))
+        if not milestone.get("interfaces_stable") and any(
+            task.get("kind") == "implementation" for task in ready + active
+        ):
+            allow_parallel = False
+
+        eligible: list[dict[str, Any]] = []
+        for task in ready:
+            if any(_tasks_conflict(task, running) for running in active):
+                continue
+            if task.get("risk") == "critical" and active:
+                continue
+            if any(running.get("risk") == "critical" for running in active):
+                continue
+            if active and not allow_parallel:
+                continue
+            eligible.append(task)
+
+        wave: list[dict[str, Any]] = []
+        for task in eligible:
+            if len(wave) >= limit:
+                break
+            if (task.get("risk") == "critical" and wave) or any(
+                selected.get("risk") == "critical" for selected in wave
+            ):
+                continue
+            if not allow_parallel and wave:
+                break
+            if any(_tasks_conflict(task, selected) for selected in wave):
+                continue
+            wave.append(task)
+        if not wave and eligible:
+            wave = [eligible[0]]
+        reason = "dependency and file-scope safe"
+        if ready and not allow_parallel:
+            reason = "parallel disabled until interfaces are stable"
+        elif ready and not eligible and active:
+            reason = "ready tasks conflict with or must wait for active work"
+        return {
+            "ok": True,
+            "milestone_id": milestone_id,
+            "plan_revision": plan.get("revision", 0),
+            "ready_count": len(ready),
+            "eligible_count": len(eligible),
+            "active_count": len(active),
+            "wave": [_compact(task) for task in wave],
+            "parallel": len(wave) > 1,
+            "reason": reason,
+        }
+
+    def _find_task(self, plan: dict[str, Any], task_id: str) -> dict[str, Any]:
+        for task in plan.get("tasks", []):
+            if task.get("id") == task_id:
+                return task
+        raise ValueError(f"Unknown task: {task_id}")
+
+    def _locate_task(
+        self, sdd: Path, task_id: str
+    ) -> tuple[str, Path, dict[str, Any], dict[str, Any], dict[str, Any]]:
+        roadmap = read_json(sdd / "roadmap.json", {"milestones": []}) or {"milestones": []}
+        for item in roadmap.get("milestones", []):
+            milestone_id = str(item.get("id") or "")
+            if not milestone_id:
+                continue
+            try:
+                resolved_id, milestone_dir, milestone, plan = self._milestone(sdd, milestone_id)
+                task = self._find_task(plan, task_id)
+                return resolved_id, milestone_dir, milestone, plan, task
+            except ValueError:
+                continue
+        raise ValueError(f"Unknown task: {task_id}")
+
+    def update_task(
+        self, root: str | None, target: str | None, payload: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Update one task without replacing or retransmitting the whole milestone plan."""
+
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        task_id = validate_id(target or payload.get("task_id") or "", "task id")
+        scalar_fields = {
+            "title",
+            "objective",
+            "priority",
+            "risk",
+            "kind",
+            "agent_role",
+            "notes",
+            "summary",
+        }
+        list_fields = {"depends_on", "acceptance", "file_scope", "requirement_ids", "decision_ids"}
+        with project_lock(sdd):
+            if payload.get("milestone_id"):
+                milestone_id, milestone_dir, _, plan = self._milestone(
+                    sdd, payload.get("milestone_id")
+                )
+                task = self._find_task(plan, task_id)
+            else:
+                milestone_id, milestone_dir, _, plan, task = self._locate_task(sdd, task_id)
+            expected_revision = options.get("expected_revision")
+            if expected_revision is not None and int(expected_revision) != int(
+                plan.get("revision") or 0
+            ):
+                raise ValueError(
+                    f"Plan revision changed: expected {expected_revision}, current {plan.get('revision', 0)}"
+                )
+            if "status" in payload:
+                raise ValueError("Use operation=transition to change task status")
+            if (
+                "depends_on" in payload
+                and task.get("status") != "pending"
+                and not options.get("force")
+            ):
+                raise ValueError(
+                    "Dependencies can change only while a task is pending unless options.force is set"
+                )
+            candidate = dict(task)
+            for key in scalar_fields:
+                if key in payload:
+                    value = payload[key]
+                    if key == "risk" and value not in _RISKS:
+                        raise ValueError(f"Invalid task risk: {value}")
+                    candidate[key] = value
+            for key in list_fields:
+                if key in payload:
+                    candidate[key] = _list(payload[key])
+            if (
+                "file_scope" in payload
+                and task.get("status") == "in_progress"
+                and not options.get("force")
+            ):
+                active = [
+                    item
+                    for item in plan.get("tasks", [])
+                    if item.get("status") == "in_progress" and item.get("id") != task_id
+                ]
+                conflicts = [item.get("id") for item in active if _tasks_conflict(candidate, item)]
+                if conflicts:
+                    raise ValueError(
+                        f"Updated scope for {task_id} conflicts with active tasks: {', '.join(map(str, conflicts))}"
+                    )
+            candidate["updated_at"] = utc_now()
+            updated_tasks = [
+                candidate if item.get("id") == task_id else item for item in plan.get("tasks", [])
+            ]
+            dag_errors = _validate_dag(updated_tasks)
+            if dag_errors:
+                raise ValueError("; ".join(dag_errors))
+            plan["tasks"] = updated_tasks
+            plan["revision"] = int(plan.get("revision") or 0) + 1
+            plan["updated_at"] = utc_now()
+            atomic_write_json(milestone_dir / "plan.json", plan)
+            self._event(
+                sdd,
+                "task_updated",
+                task_id=task_id,
+                milestone_id=milestone_id,
+                fields=sorted(key for key in payload if key != "task_id"),
+                plan_revision=plan["revision"],
+            )
+            render_all(project_root)
+        return {"ok": True, "task": _compact(candidate), "plan_revision": plan["revision"]}
+
+    def transition(
+        self, root: str | None, target: str | None, payload: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        task_id = validate_id(target or payload.get("task_id") or "", "task id")
+        new_status = str(payload.get("status") or "").lower()
+        if new_status not in _TASK_STATES:
+            raise ValueError(f"Invalid task status: {new_status}")
+        allowed = {
+            "pending": {"in_progress", "blocked", "skipped"},
+            "in_progress": {"done", "blocked", "pending"},
+            "blocked": {"pending", "in_progress", "skipped"},
+            "done": {"in_progress"},
+            "skipped": {"pending"},
+        }
+        with project_lock(sdd):
+            if payload.get("milestone_id"):
+                milestone_id, milestone_dir, milestone, plan = self._milestone(
+                    sdd, payload.get("milestone_id")
+                )
+                task = self._find_task(plan, task_id)
+            else:
+                milestone_id, milestone_dir, milestone, plan, task = self._locate_task(sdd, task_id)
+            expected_revision = options.get("expected_revision")
+            if expected_revision is not None and int(expected_revision) != int(
+                plan.get("revision") or 0
+            ):
+                raise ValueError(
+                    f"Plan revision changed: expected {expected_revision}, current {plan.get('revision', 0)}"
+                )
+            old_status = task.get("status", "pending")
+            if new_status != old_status and new_status not in allowed.get(old_status, set()):
+                raise ValueError(f"Invalid transition {old_status} -> {new_status} for {task_id}")
+            state = read_json(sdd / "state.json", {}) or {}
+            if (
+                new_status == "in_progress"
+                and old_status != "in_progress"
+                and not options.get("force")
+            ):
+                if state.get("active_milestone") and state.get("active_milestone") != milestone_id:
+                    raise ValueError(
+                        f"Cannot start {task_id}; active milestone is {state.get('active_milestone')}, not {milestone_id}"
+                    )
+                done = {
+                    item.get("id")
+                    for item in plan.get("tasks", [])
+                    if item.get("status") in {"done", "skipped"}
+                }
+                unmet = [dep for dep in _list(task.get("depends_on")) if dep not in done]
+                if unmet:
+                    raise ValueError(
+                        f"Cannot start {task_id}; incomplete dependencies: {', '.join(map(str, unmet))}"
+                    )
+                active = [
+                    item
+                    for item in plan.get("tasks", [])
+                    if item.get("status") == "in_progress" and item.get("id") != task_id
+                ]
+                if (
+                    active
+                    and not milestone.get("interfaces_stable")
+                    and (
+                        task.get("kind") == "implementation"
+                        or any(item.get("kind") == "implementation" for item in active)
+                    )
+                ):
+                    raise ValueError(
+                        f"Cannot start {task_id}; implementation interfaces are unstable"
+                    )
+                if task.get("risk") == "critical" and active:
+                    raise ValueError(
+                        f"Cannot start critical task {task_id} while other tasks are active"
+                    )
+                if any(item.get("risk") == "critical" for item in active):
+                    raise ValueError(f"Cannot start {task_id} while a critical task is active")
+                conflicts = [item.get("id") for item in active if _tasks_conflict(task, item)]
+                if conflicts:
+                    raise ValueError(
+                        f"Cannot start {task_id}; file scope conflicts with active tasks: {', '.join(map(str, conflicts))}"
+                    )
+            task["status"] = new_status
+            task["updated_at"] = utc_now()
+            if payload.get("summary") is not None:
+                task["summary"] = str(payload.get("summary") or "")
+            if payload.get("notes") is not None:
+                task["notes"] = str(payload.get("notes") or "")
+            if payload.get("blocked_reason") is not None:
+                task["blocked_reason"] = str(payload.get("blocked_reason") or "")
+            plan["revision"] = int(plan.get("revision") or 0) + 1
+            plan["updated_at"] = utc_now()
+            atomic_write_json(milestone_dir / "plan.json", plan)
+            current = {
+                item.get("id")
+                for item in plan.get("tasks", [])
+                if item.get("status") == "in_progress" and item.get("id")
+            }
+            state["current_tasks"] = sorted(current)
+            state["updated_at"] = utc_now()
+            if payload.get("evidence"):
+                evidence = self._record_evidence_locked(
+                    project_root, sdd, milestone_dir, task, payload["evidence"]
+                )
+                plan["revision"] += 1
+                plan["updated_at"] = utc_now()
+                atomic_write_json(milestone_dir / "plan.json", plan)
+            else:
+                evidence = None
+            terminal_states = {item.get("status") for item in plan.get("tasks", [])}
+            if terminal_states and terminal_states <= {"done", "skipped"}:
+                milestone["status"] = "done"
+                state["status"] = "verifying"
+            elif current:
+                milestone["status"] = "in_progress"
+                state["status"] = "executing"
+            elif any(
+                item.get("status") == "blocked" for item in plan.get("tasks", [])
+            ) and not self._ready_tasks(plan.get("tasks", [])):
+                milestone["status"] = "blocked"
+                state["status"] = "blocked"
+            else:
+                milestone["status"] = "ready"
+                state["status"] = "ready"
+            atomic_write_json(sdd / "state.json", state)
+            milestone["updated_at"] = utc_now()
+            atomic_write_json(milestone_dir / "milestone.json", milestone)
+            self._sync_roadmap_milestone(sdd, milestone)
+            self._event(
+                sdd,
+                "task_transition",
+                task_id=task_id,
+                from_status=old_status,
+                to_status=new_status,
+                summary=task.get("summary"),
+                plan_revision=plan["revision"],
+            )
+            render_all(project_root)
+        return {
+            "ok": True,
+            "task": _compact(task),
+            "evidence": evidence,
+            "milestone_status": milestone.get("status"),
+            "plan_revision": plan["revision"],
+        }
+
+    def _record_evidence_locked(
+        self,
+        project_root: Path,
+        sdd: Path,
+        milestone_dir: Path,
+        task: dict[str, Any] | None,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        existing = read_jsonl(milestone_dir / "evidence.jsonl")
+        evidence_id = payload.get("id") or _next_numeric_id(
+            [item.get("id", "") for item in existing], "E", 6
+        )
+        evidence_id = validate_id(evidence_id, "evidence id")
+        result_text = str(payload.get("result") or "").strip()
+        if not any(
+            (result_text, payload.get("command"), payload.get("artifact"), payload.get("details"))
+        ):
+            raise ValueError("Evidence requires a result, command, artifact, or details")
+        passed = payload.get("passed")
+        if passed is None:
+            lowered = result_text.lower()
+            if any(
+                word in lowered for word in ("fail", "error", "broken", "blocked", "regression")
+            ):
+                passed = False
+            elif any(word in lowered for word in ("pass", "success", "verified", "complete", "ok")):
+                passed = True
+        evidence = {
+            "id": evidence_id,
+            "at": utc_now(),
+            "task_id": payload.get("task_id") or (task.get("id") if task else None),
+            "type": payload.get("type") or "test",
+            "result": result_text,
+            "passed": passed,
+            "command": payload.get("command") or "",
+            "artifact": payload.get("artifact") or "",
+            "requirement_ids": _list(
+                payload.get("requirement_ids") or (task.get("requirement_ids", []) if task else [])
+            ),
+            "details": payload.get("details") or "",
+        }
+        append_jsonl(milestone_dir / "evidence.jsonl", evidence)
+        if task is not None:
+            task.setdefault("evidence_ids", [])
+            if evidence_id not in task["evidence_ids"]:
+                task["evidence_ids"].append(evidence_id)
+        self._event(
+            sdd,
+            "evidence_recorded",
+            evidence_id=evidence_id,
+            task_id=evidence.get("task_id"),
+            result=evidence.get("result"),
+        )
+        return evidence
+
+    def record_evidence(
+        self, root: str | None, target: str | None, payload: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        task_id = target or payload.get("task_id")
+        if task_id:
+            task_id = validate_id(task_id, "task id")
+        with project_lock(sdd):
+            if task_id:
+                if payload.get("milestone_id"):
+                    milestone_id, milestone_dir, _, plan = self._milestone(
+                        sdd, payload.get("milestone_id")
+                    )
+                    task = self._find_task(plan, task_id)
+                else:
+                    milestone_id, milestone_dir, _, plan, task = self._locate_task(sdd, task_id)
+            else:
+                milestone_id, milestone_dir, _, plan = self._milestone(
+                    sdd, payload.get("milestone_id")
+                )
+                task = None
+            expected_revision = options.get("expected_revision")
+            if expected_revision is not None and int(expected_revision) != int(
+                plan.get("revision") or 0
+            ):
+                raise ValueError(
+                    f"Plan revision changed: expected {expected_revision}, current {plan.get('revision', 0)}"
+                )
+            evidence = self._record_evidence_locked(project_root, sdd, milestone_dir, task, payload)
+            plan["revision"] = int(plan.get("revision") or 0) + 1
+            plan["updated_at"] = utc_now()
+            atomic_write_json(milestone_dir / "plan.json", plan)
+            render_all(project_root)
+        return {
+            "ok": True,
+            "milestone_id": milestone_id,
+            "evidence": evidence,
+            "plan_revision": plan["revision"],
+        }
+
+    def finalize_milestone(
+        self, root: str | None, target: str | None, payload: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        summary = str(payload.get("summary") or "Milestone completed and verified.").strip()
+        with project_lock(sdd):
+            milestone_id, milestone_dir, milestone, plan = self._milestone(
+                sdd, target or payload.get("milestone_id")
+            )
+            expected_revision = options.get("expected_revision")
+            if expected_revision is not None and int(expected_revision) != int(
+                plan.get("revision") or 0
+            ):
+                raise ValueError(
+                    f"Plan revision changed: expected {expected_revision}, current {plan.get('revision', 0)}"
+                )
+            state = read_json(sdd / "state.json", {}) or {}
+            if (
+                state.get("active_milestone")
+                and state.get("active_milestone") != milestone_id
+                and not options.get("force")
+            ):
+                raise ValueError(
+                    f"Cannot finalize {milestone_id}; active milestone is {state.get('active_milestone')}"
+                )
+            if not plan.get("tasks") and not options.get("force"):
+                raise ValueError("Milestone has no planned tasks")
+            incomplete = [
+                task.get("id")
+                for task in plan.get("tasks", [])
+                if task.get("status") not in {"done", "skipped"}
+            ]
+            if incomplete and not options.get("force"):
+                raise ValueError(
+                    f"Milestone has incomplete tasks: {', '.join(str(item) for item in incomplete)}"
+                )
+            validation = self.validate(str(project_root), {"record": False}, {"detail": "normal"})
+            # Finalize just-in-time: defects in future, not-yet-active milestones should
+            # remain visible in project health without blocking delivery of this one.
+            task_ids = {str(task.get("id")) for task in plan.get("tasks", [])}
+            relevant_targets = {
+                None,
+                milestone_id,
+                *task_ids,
+                *map(str, milestone.get("requirement_ids", [])),
+            }
+            blocking = [
+                item
+                for item in validation.get("findings", [])
+                if (item.get("severity") == "error" and item.get("target") in relevant_targets)
+                or (item.get("code") == "task.evidence_missing" and item.get("target") in task_ids)
+            ]
+            if blocking and not options.get("force"):
+                codes = ", ".join(sorted({str(item.get("code")) for item in blocking}))
+                raise ValueError(
+                    f"Milestone cannot be finalized until validation blockers are resolved: {codes}"
+                )
+            milestone["status"] = "verified"
+            milestone["completed_at"] = utc_now()
+            milestone["updated_at"] = utc_now()
+            atomic_write_json(milestone_dir / "milestone.json", milestone)
+            atomic_write_text(
+                milestone_dir / "summary.md",
+                f"# {milestone_id} summary\n\n{summary}\n",
+            )
+            self._sync_roadmap_milestone(sdd, milestone)
+            roadmap = read_json(sdd / "roadmap.json", {"milestones": []}) or {"milestones": []}
+            remaining = [
+                item
+                for item in roadmap.get("milestones", [])
+                if item.get("id") != milestone_id
+                and item.get("status") not in {"verified", "cancelled"}
+            ]
+            state["current_tasks"] = []
+            state["active_milestone"] = remaining[0].get("id") if remaining else None
+            state["status"] = (
+                "verifying"
+                if remaining and remaining[0].get("status") == "done"
+                else "planning"
+                if remaining
+                else "complete"
+            )
+            state["updated_at"] = utc_now()
+            atomic_write_json(sdd / "state.json", state)
+            project = read_json(sdd / "project.json", {}) or {}
+            if not remaining:
+                project["status"] = "complete"
+                project["updated_at"] = utc_now()
+                atomic_write_json(sdd / "project.json", project)
+            self._event(
+                sdd,
+                "milestone_finalized",
+                milestone_id=milestone_id,
+                next_milestone=state.get("active_milestone"),
+                plan_revision=plan.get("revision", 0),
+            )
+            render_all(project_root)
+        return {
+            "ok": True,
+            "milestone_id": milestone_id,
+            "status": "verified",
+            "next_milestone": state.get("active_milestone"),
+            "project_status": project.get("status"),
+            "plan_revision": plan.get("revision", 0),
+            "health": {"score": validation.get("score"), "counts": validation.get("counts")},
+        }
+
+    def record_decision(
+        self, root: str | None, target: str | None, payload: dict[str, Any], _: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        with project_lock(sdd):
+            existing = [path.stem for path in (sdd / "decisions").glob("ADR-*.json")]
+            decision_id = validate_id(
+                target or payload.get("id") or _next_numeric_id(existing, "ADR-", 4), "decision id"
+            )
+            previous = read_json(sdd / "decisions" / f"{decision_id}.json", {}) or {}
+            decision = {
+                "id": decision_id,
+                "title": payload.get("title") or previous.get("title") or decision_id,
+                "status": payload.get("status") or previous.get("status") or "accepted",
+                "context": payload.get("context")
+                if "context" in payload
+                else previous.get("context", ""),
+                "decision": payload.get("decision")
+                if "decision" in payload
+                else previous.get("decision", ""),
+                "alternatives": _list(
+                    payload.get("alternatives", previous.get("alternatives", []))
+                ),
+                "consequences": _list(
+                    payload.get("consequences", previous.get("consequences", []))
+                ),
+                "requirement_ids": _list(
+                    payload.get("requirement_ids", previous.get("requirement_ids", []))
+                ),
+                "created_at": previous.get("created_at") or payload.get("created_at") or utc_now(),
+                "updated_at": utc_now(),
+            }
+            atomic_write_json(sdd / "decisions" / f"{decision_id}.json", decision)
+            self._event(
+                sdd, "decision_recorded", decision_id=decision_id, title=decision.get("title")
+            )
+            render_decision_index(project_root)
+        return {"ok": True, "decision": _compact(decision)}
+
+    def context_pack(
+        self, root: str | None, target: str | None, payload: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        config = read_json(sdd / "config.json", {}) or {}
+        budget = int(options.get("budget_tokens") or config.get("context_budget_tokens") or 12000)
+        task_id = target or payload.get("task_id")
+        milestone_id = payload.get("milestone_id")
+        if task_id and not milestone_id:
+            milestone_id, _, _, _, _ = self._locate_task(sdd, validate_id(task_id, "task id"))
+        return {
+            "ok": True,
+            **build_context_pack(
+                project_root,
+                milestone_id=milestone_id,
+                task_id=task_id,
+                budget_tokens=max(2000, min(budget, 80000)),
+                checkpoint_id=payload.get("checkpoint_id"),
+                include_git=bool(options.get("include_git", True)),
+            ),
+        }
+
+    def context_checkpoint(
+        self, root: str | None, target: str | None, payload: dict[str, Any], _: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        task = None
+        if payload.get("task_id"):
+            _, _, _, _, task = self._locate_task(sdd, validate_id(payload["task_id"], "task id"))
+        with project_lock(sdd):
+            snapshot = create_checkpoint(project_root, target or payload.get("id"), task)
+            state = read_json(sdd / "state.json", {}) or {}
+            state["last_checkpoint"] = snapshot["id"]
+            state["updated_at"] = utc_now()
+            atomic_write_json(sdd / "state.json", state)
+            self._event(
+                sdd,
+                "checkpoint_created",
+                checkpoint_id=snapshot["id"],
+                task_id=snapshot.get("task_id"),
+            )
+            render_all(project_root)
+            # Capture the checkpoint event and state pointer so an immediate delta is empty.
+            snapshot = create_checkpoint(project_root, snapshot["id"], task)
+        return {"ok": True, "checkpoint": snapshot}
+
+    def context_delta(
+        self, root: str | None, target: str | None, payload: dict[str, Any], _: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        checkpoint_id = validate_id(target or payload.get("checkpoint_id") or "", "checkpoint id")
+        task = None
+        if payload.get("task_id"):
+            _, _, _, _, task = self._locate_task(sdd, validate_id(payload["task_id"], "task id"))
+        return {"ok": True, **checkpoint_delta(project_root, checkpoint_id, task)}
+
+    def validate(
+        self, root: str | None, payload: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        project = read_json(sdd / "project.json", {}) or {}
+        config = read_json(sdd / "config.json", {}) or {}
+        state = read_json(sdd / "state.json", {}) or {}
+        requirements = read_json(sdd / "requirements.json", {"requirements": []}) or {
+            "requirements": []
+        }
+        roadmap = read_json(sdd / "roadmap.json", {"milestones": []}) or {"milestones": []}
+        requirement_rows = requirements.get("requirements", [])
+        req_ids = {item.get("id") for item in requirement_rows if item.get("id")}
+        decision_ids = {path.stem for path in (sdd / "decisions").glob("ADR-*.json")}
+        milestone_rows = roadmap.get("milestones", [])
+        milestone_ids = {item.get("id") for item in milestone_rows if item.get("id")}
+        findings: list[dict[str, Any]] = []
+
+        def add(severity: str, code: str, message: str, target: str | None = None) -> None:
+            if config.get("strict") and severity == "warning" and code != "artifact.large":
+                severity = "error"
+            findings.append(
+                _compact({"severity": severity, "code": code, "message": message, "target": target})
+            )
+
+        requirement_id_list = [item.get("id") for item in requirement_rows if item.get("id")]
+        for duplicate in sorted(
+            {item for item in requirement_id_list if requirement_id_list.count(item) > 1}
+        ):
+            add(
+                "error",
+                "requirement.duplicate_id",
+                f"Duplicate requirement id {duplicate}",
+                duplicate,
+            )
+        milestone_id_list = [item.get("id") for item in milestone_rows if item.get("id")]
+        for duplicate in sorted(
+            {item for item in milestone_id_list if milestone_id_list.count(item) > 1}
+        ):
+            add("error", "milestone.duplicate_id", f"Duplicate milestone id {duplicate}", duplicate)
+        if state.get("active_milestone") and state.get("active_milestone") not in milestone_ids:
+            add(
+                "error",
+                "state.unknown_milestone",
+                "State references an unknown active milestone",
+                state.get("active_milestone"),
+            )
+
+        if not project.get("goal"):
+            add("error", "project.goal_missing", "Project goal is empty")
+        if not project.get("success_criteria") and project.get("mode") != "quick":
+            add("warning", "project.success_missing", "No project success criteria recorded")
+        if project.get("mode") in {"deep", "program"}:
+            architecture = (
+                (sdd / "architecture.md").read_text(encoding="utf-8")
+                if (sdd / "architecture.md").exists()
+                else ""
+            )
+            if len(architecture.strip()) < 80 or "Not established" in architecture:
+                add(
+                    "warning",
+                    "architecture.missing",
+                    "Deep/program project has no meaningful architecture record",
+                )
+        for req in requirement_rows:
+            if not req.get("statement"):
+                add(
+                    "error",
+                    "requirement.statement_missing",
+                    "Requirement has no statement",
+                    req.get("id"),
+                )
+            if not req.get("acceptance"):
+                add(
+                    "warning",
+                    "requirement.acceptance_missing",
+                    "Requirement has no acceptance criteria",
+                    req.get("id"),
+                )
+
+        linked_requirements: set[str] = set()
+        all_tasks: dict[str, dict[str, Any]] = {}
+        for milestone in milestone_rows:
+            milestone_id = milestone.get("id")
+            linked_requirements.update(map(str, milestone.get("requirement_ids", [])))
+            milestone_file = read_json(sdd / "milestones" / str(milestone_id) / "milestone.json")
+            if not milestone_file:
+                add(
+                    "error",
+                    "milestone.file_missing",
+                    "Milestone metadata file is missing",
+                    milestone_id,
+                )
+            elif any(
+                milestone_file.get(key) != milestone.get(key)
+                for key in ("title", "status", "objective", "interfaces_stable")
+            ):
+                add(
+                    "warning",
+                    "milestone.roadmap_drift",
+                    "Roadmap projection differs from milestone metadata",
+                    milestone_id,
+                )
+            for req_id in milestone.get("requirement_ids", []):
+                if req_id not in req_ids:
+                    add(
+                        "error",
+                        "milestone.unknown_requirement",
+                        f"Milestone references unknown requirement {req_id}",
+                        milestone_id,
+                    )
+            for decision_id in milestone.get("decision_ids", []):
+                if decision_id not in decision_ids:
+                    add(
+                        "error",
+                        "milestone.unknown_decision",
+                        f"Milestone references unknown decision {decision_id}",
+                        milestone_id,
+                    )
+            if not milestone.get("exit_criteria"):
+                add(
+                    "warning",
+                    "milestone.exit_missing",
+                    "Milestone has no exit criteria",
+                    milestone_id,
+                )
+            plan = read_json(
+                sdd / "milestones" / str(milestone_id) / "plan.json", {"tasks": []}
+            ) or {"tasks": []}
+            if plan.get("milestone_id") not in (None, milestone_id):
+                add(
+                    "error",
+                    "plan.milestone_mismatch",
+                    "Plan belongs to a different milestone",
+                    milestone_id,
+                )
+            if not isinstance(plan.get("revision", 0), int) or int(plan.get("revision", 0)) < 0:
+                add(
+                    "error",
+                    "plan.revision_invalid",
+                    "Plan revision must be a non-negative integer",
+                    milestone_id,
+                )
+            task_id_list = [item.get("id") for item in plan.get("tasks", []) if item.get("id")]
+            for duplicate in sorted(
+                {item for item in task_id_list if task_id_list.count(item) > 1}
+            ):
+                add("error", "task.duplicate_id", f"Duplicate task id {duplicate}", duplicate)
+            dag_errors = _validate_dag(plan.get("tasks", []))
+            for error in dag_errors:
+                add("error", "plan.invalid_dag", error, milestone_id)
+            evidence = read_jsonl(sdd / "milestones" / str(milestone_id) / "evidence.jsonl")
+            evidence_by_task = Counter(item.get("task_id") for item in evidence)
+            successful_evidence_by_task = Counter(
+                item.get("task_id") for item in evidence if item.get("passed") is True
+            )
+            for task in plan.get("tasks", []):
+                task_id = task.get("id")
+                if task_id:
+                    if task_id in all_tasks:
+                        add(
+                            "error",
+                            "task.global_duplicate_id",
+                            "Task id is reused across milestones",
+                            task_id,
+                        )
+                    all_tasks[task_id] = task
+                if not task.get("objective"):
+                    add("warning", "task.objective_missing", "Task has no objective", task_id)
+                if not task.get("acceptance"):
+                    add(
+                        "warning",
+                        "task.acceptance_missing",
+                        "Task has no acceptance criteria",
+                        task_id,
+                    )
+                for req_id in task.get("requirement_ids", []):
+                    if req_id not in req_ids:
+                        add(
+                            "error",
+                            "task.unknown_requirement",
+                            f"Task references unknown requirement {req_id}",
+                            task_id,
+                        )
+                for decision_id in task.get("decision_ids", []):
+                    if decision_id not in decision_ids:
+                        add(
+                            "error",
+                            "task.unknown_decision",
+                            f"Task references unknown decision {decision_id}",
+                            task_id,
+                        )
+                if (
+                    project.get("mode") in {"deep", "program"}
+                    and task.get("kind") == "implementation"
+                    and not task.get("file_scope")
+                ):
+                    add(
+                        "warning",
+                        "task.scope_missing",
+                        "Implementation task has no file scope and will serialize all work",
+                        task_id,
+                    )
+                if task.get("status") == "skipped" and not (
+                    task.get("summary") or task.get("notes")
+                ):
+                    add(
+                        "warning",
+                        "task.skip_reason_missing",
+                        "Skipped task has no recorded rationale",
+                        task_id,
+                    )
+                policy = config.get("require_evidence", "risk_based")
+                if policy == "always":
+                    require_evidence = True
+                elif policy == "never":
+                    require_evidence = False
+                else:
+                    require_evidence = task.get("risk") in {"high", "critical"} or project.get(
+                        "mode"
+                    ) in {"deep", "program"}
+                if (
+                    task.get("status") == "done"
+                    and require_evidence
+                    and not successful_evidence_by_task.get(task_id)
+                ):
+                    message = "Completed task has no successful evidence"
+                    if evidence_by_task.get(task_id):
+                        message += " (recorded evidence is failed or unclassified)"
+                    add("warning", "task.evidence_missing", message, task_id)
+                if task.get("status") == "blocked" and not task.get("blocked_reason"):
+                    add(
+                        "warning",
+                        "task.block_reason_missing",
+                        "Blocked task has no reason",
+                        task_id,
+                    )
+
+        if milestone_rows:
+            for req in requirement_rows:
+                req_id = str(req.get("id") or "")
+                if (
+                    req_id
+                    and req.get("status", "active") == "active"
+                    and req.get("priority", "must") == "must"
+                    and req_id not in linked_requirements
+                ):
+                    add(
+                        "warning",
+                        "requirement.unplanned",
+                        "Active must-have requirement is not linked to a milestone",
+                        req_id,
+                    )
+        for task_id in state.get("current_tasks", []):
+            task = all_tasks.get(task_id)
+            if not task:
+                add(
+                    "error",
+                    "state.unknown_current_task",
+                    "State references an unknown current task",
+                    task_id,
+                )
+            elif task.get("status") != "in_progress":
+                add(
+                    "warning",
+                    "state.current_task_drift",
+                    "State current task is not marked in progress",
+                    task_id,
+                )
+
+        max_chars = int(config.get("max_artifact_chars") or 50000)
+        for path in sdd.rglob("*"):
+            if (
+                path.is_file()
+                and path.suffix in {".md", ".json", ".jsonl"}
+                and path.stat().st_size > max_chars
+            ):
+                add(
+                    "warning",
+                    "artifact.large",
+                    f"Artifact exceeds {max_chars} bytes; split or summarize it",
+                    str(path.relative_to(project_root)),
+                )
+        weights = {"error": 15, "warning": 5, "info": 1}
+        score = max(0, 100 - sum(weights.get(item["severity"], 0) for item in findings))
+        severity_counts = Counter(item["severity"] for item in findings)
+        result = {
+            "ok": not severity_counts.get("error"),
+            "score": score,
+            "counts": dict(severity_counts),
+            "findings": findings if options.get("detail", "normal") != "compact" else findings[:10],
+        }
+        if payload.get("record", True):
+            self._event(sdd, "validation_completed", score=score, counts=dict(severity_counts))
+        return result
+
+    def status(
+        self, root: str | None, _: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        project = read_json(sdd / "project.json", {}) or {}
+        state = read_json(sdd / "state.json", {}) or {}
+        roadmap = read_json(sdd / "roadmap.json", {"milestones": []}) or {"milestones": []}
+        counts: Counter[str] = Counter()
+        active = None
+        active_plan = {"tasks": []}
+        for milestone in roadmap.get("milestones", []):
+            plan = read_json(
+                sdd / "milestones" / str(milestone.get("id")) / "plan.json", {"tasks": []}
+            ) or {"tasks": []}
+            counts.update(task.get("status", "pending") for task in plan.get("tasks", []))
+            if milestone.get("id") == state.get("active_milestone"):
+                active = milestone
+                active_plan = plan
+        validation = self.validate(str(project_root), {"record": False}, {"detail": "compact"})
+        next_wave = None
+        if active:
+            next_wave = self.next(
+                str(project_root), active.get("id"), {}, {"limit": options.get("limit", 4)}
+            )
+        return {
+            "ok": True,
+            "root": str(project_root),
+            "project": {
+                key: project.get(key) for key in ("name", "goal", "summary", "mode", "status")
+            },
+            "state": state,
+            "milestone_count": len(roadmap.get("milestones", [])),
+            "task_counts": dict(counts),
+            "active_milestone": active,
+            "active_tasks": [_compact(task) for task in active_plan.get("tasks", [])],
+            "next": next_wave,
+            "health": {"score": validation.get("score"), "counts": validation.get("counts")},
+        }
+
+    def search(
+        self, root: str | None, target: str | None, payload: dict[str, Any], options: dict[str, Any]
+    ) -> dict[str, Any]:
+        project_root = self._root(root)
+        sdd = self._require(project_root)
+        query = str(target or payload.get("query") or "").strip().lower()
+        if not query:
+            raise ValueError("search requires target or payload.query")
+        limit = max(1, min(int(options.get("limit") or 20), 100))
+        results: list[dict[str, Any]] = []
+        for path in sorted(sdd.rglob("*")):
+            if not path.is_file() or path.suffix not in {".md", ".json", ".jsonl"}:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            lower = content.lower()
+            start = lower.find(query)
+            if start < 0:
+                continue
+            excerpt = content[
+                max(0, start - 180) : min(len(content), start + len(query) + 420)
+            ].replace("\n", " ")
+            results.append({"path": str(path.relative_to(project_root)), "excerpt": excerpt})
+            if len(results) >= limit:
+                break
+        return {"ok": True, "query": query, "results": results}
+
+    def snapshot(self, root: str | None) -> dict[str, Any]:
+        project_root = self._root(root)
+        status = self.status(str(project_root), {}, {"limit": 6})
+        sdd = self._require(project_root)
+        roadmap = read_json(sdd / "roadmap.json", {"milestones": []}) or {"milestones": []}
+        requirements = read_json(sdd / "requirements.json", {"requirements": []}) or {
+            "requirements": []
+        }
+        return {
+            **status,
+            "roadmap": roadmap.get("milestones", []),
+            "requirements": requirements.get("requirements", []),
+        }
+
+    def execute(
+        self,
+        operation: str,
+        *,
+        root: str | None = None,
+        target: str | None = None,
+        payload: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = payload or {}
+        options = options or {}
+        operation = str(operation or "").strip().lower()
+        dispatch = {
+            "init": lambda: self.init(root, payload, options),
+            "status": lambda: self.status(root, payload, options),
+            "configure": lambda: self.configure(root, payload, options),
+            "upsert_spec": lambda: self.upsert_spec(root, payload, options),
+            "create_milestone": lambda: self.create_milestone(root, payload, options),
+            "update_milestone": lambda: self.update_milestone(root, target, payload, options),
+            "set_plan": lambda: self.set_plan(root, payload, options),
+            "update_task": lambda: self.update_task(root, target, payload, options),
+            "next": lambda: self.next(root, target, payload, options),
+            "transition": lambda: self.transition(root, target, payload, options),
+            "record_decision": lambda: self.record_decision(root, target, payload, options),
+            "record_evidence": lambda: self.record_evidence(root, target, payload, options),
+            "finalize_milestone": lambda: self.finalize_milestone(root, target, payload, options),
+            "context_pack": lambda: self.context_pack(root, target, payload, options),
+            "context_checkpoint": lambda: self.context_checkpoint(root, target, payload, options),
+            "context_delta": lambda: self.context_delta(root, target, payload, options),
+            "validate": lambda: self.validate(root, payload, options),
+            "search": lambda: self.search(root, target, payload, options),
+            "register_source": lambda: {
+                "ok": True,
+                "source": self.registry.register(
+                    payload.get("path") or root or "", payload.get("name")
+                ),
+            },
+            "list_sources": lambda: {"ok": True, "sources": self.registry.list()},
+            "remove_source": lambda: {
+                "ok": self.registry.remove(target or payload.get("id") or payload.get("path") or "")
+            },
+        }
+        if operation not in dispatch:
+            raise ValueError(f"Unknown SDD operation: {operation}")
+        return dispatch[operation]()
+
+
+def tool_response(service: SDDService, params: dict[str, Any]) -> str:
+    try:
+        result = service.execute(
+            params.get("operation", ""),
+            root=params.get("root"),
+            target=params.get("target"),
+            payload=params.get("payload") or {},
+            options=params.get("options") or {},
+        )
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    except Exception as exc:  # Hermes tool handlers should return structured errors.
+        return json.dumps(
+            {
+                "ok": False,
+                "error": type(exc).__name__,
+                "message": str(exc),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )

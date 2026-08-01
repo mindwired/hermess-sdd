@@ -1,0 +1,14 @@
+{
+  "name": "sdd",
+  "label": "SDD",
+  "description": "Adaptive, context-efficient spec-driven development",
+  "icon": "FileText",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/sdd",
+    "position": "after:skills"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
