@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from hermes_sdd.ui_install import desktop_status, install_desktop, uninstall_desktop
 
@@ -32,6 +33,21 @@ class DesktopInstallTest(unittest.TestCase):
         self.assertEqual(result["mode"], "link")
         self.assertTrue(Path(result["target"]).is_symlink())
         self.assertTrue(result["current"])
+
+    def test_auto_install_preserves_current_copy(self) -> None:
+        install_desktop(mode="copy", home=self.home)
+        result = install_desktop(home=self.home)
+        self.assertEqual(result["mode"], "copy")
+        self.assertFalse(result["changed"])
+        self.assertNotIn("warning", result)
+
+    def test_auto_force_switches_current_copy_to_posix_link(self) -> None:
+        install_desktop(mode="copy", home=self.home)
+        with patch("hermes_sdd.ui_install.os.name", "posix"):
+            result = install_desktop(force=True, home=self.home)
+        self.assertEqual(result["mode"], "link")
+        self.assertTrue(Path(result["target"]).is_symlink())
+        self.assertTrue(result["changed"])
 
     def test_different_existing_target_requires_force(self) -> None:
         target = self.home / "desktop-plugins" / "sdd" / "plugin.js"

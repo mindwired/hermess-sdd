@@ -107,7 +107,13 @@ def install_desktop(
     before = desktop_status(home)
     selected = mode
     if selected == "auto":
-        selected = "copy" if os.name == "nt" else "link"
+        # Keep an already-current installation stable. This makes the normal
+        # command idempotent even when an older install was explicitly made as
+        # a copy on POSIX. The platform-preferred mode applies to fresh installs.
+        if before["installed"] and before["current"] and not force:
+            selected = before["mode"]
+        else:
+            selected = "copy" if os.name == "nt" else "link"
 
     if before["installed"] and before["current"]:
         if selected == "copy" and before["mode"] == "copy":

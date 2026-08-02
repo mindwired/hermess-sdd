@@ -33,8 +33,9 @@ Agent and Dashboard install together. Desktop cannot be discovered from the regu
 `hermes sdd ui install` creates the smallest possible bridge. This is also a one-time global installation, not a
 per-project setup step.
 
-On POSIX, the default is a symlink. On Windows, it is a copy because symlink privileges are inconsistent.
-Explicit modes are available:
+On a fresh install, the default is a symlink on POSIX and a copy on Windows because symlink privileges are
+inconsistent. If a current adapter already exists, the default preserves its mode so repeated installs are
+idempotent. Explicit modes are available:
 
 ```bash
 hermes sdd ui install --mode link
@@ -134,7 +135,7 @@ Copy Desktop installation:
 
 ```bash
 hermes plugins update sdd
-hermes sdd ui install --force
+hermes sdd ui install --force   # replace the copied adapter after the source update
 hermes gateway restart
 ```
 

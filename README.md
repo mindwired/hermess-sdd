@@ -61,9 +61,10 @@ Restart the gateway after the plugin install. Restart the Dashboard process, the
 Hermes Desktop, open the command palette and run **Reload desktop plugins** (or restart Desktop). Both UIs then
 show **SDD** in the sidebar and open it at `/sdd`.
 
-On Linux and macOS, `auto` mode creates a symlink from Hermes Desktop's plugin folder to the installed
-repository. A normal `hermes plugins update sdd` then updates both layers automatically. Windows uses a copy
-fallback; run `hermes sdd ui install --force` after an update.
+On a fresh Linux or macOS install, `auto` mode creates a symlink from Hermes Desktop's plugin folder to the
+installed repository. A normal `hermes plugins update sdd` then updates both layers automatically. Windows uses a
+copy fallback. If an existing adapter is current, `auto` preserves its existing copy/link mode; use `--force` only
+when intentionally switching modes or replacing a different target.
 
 Verify everything:
 
