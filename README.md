@@ -49,11 +49,17 @@ hermes gateway restart
 
 This installs the Agent tool, slash commands, CLI command, skills, Dashboard frontend, and backend.
 
-Install the optional native Desktop adapter once:
+It is a global installation for the active Hermes profile. Do this once; do not repeat it in every project.
+
+Install the native Desktop adapter once as well:
 
 ```bash
 hermes sdd ui install
 ```
+
+Restart the gateway after the plugin install. Restart the Dashboard process, then reload the browser page. In
+Hermes Desktop, open the command palette and run **Reload desktop plugins** (or restart Desktop). Both UIs then
+show **SDD** in the sidebar and open it at `/sdd`.
 
 On Linux and macOS, `auto` mode creates a symlink from Hermes Desktop's plugin folder to the installed
 repository. A normal `hermes plugins update sdd` then updates both layers automatically. Windows uses a copy
@@ -78,12 +84,18 @@ because Hermes intentionally loads it from `$HERMES_HOME/desktop-plugins/sdd/plu
 
 ## First project
 
+The plugin is global, while SDD state is intentionally per project. In each project, initialize the local state
+once; this does not reinstall or configure the plugin:
+
 From a project directory:
 
 ```bash
 hermes sdd init auto "Build a local-first observability platform"
 hermes sdd status
 ```
+
+The same project can be opened later from any Hermes surface. Its `.sdd/` directory is the authoritative local
+state; the installed plugin and its UI adapters stay available globally.
 
 Or inside any Hermes chat surface:
 

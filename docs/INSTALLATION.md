@@ -12,7 +12,8 @@ hermes sdd ui install
 hermes sdd doctor
 ```
 
-The first command clones the complete repository into the active profile's plugin directory. Keeping the plugin
+This is a one-time global installation for the active Hermes profile. It clones the complete repository into the
+profile's plugin directory; do not repeat it for each project. Keeping the plugin
 at the repository root is important: Hermes retains the Git checkout, so later updates can use:
 
 ```bash
@@ -29,7 +30,8 @@ Hermes has three intentionally separate extension systems:
 - Native Desktop adapter: `$HERMES_HOME/desktop-plugins/sdd/plugin.js`
 
 Agent and Dashboard install together. Desktop cannot be discovered from the regular plugin folder, so
-`hermes sdd ui install` creates the smallest possible bridge.
+`hermes sdd ui install` creates the smallest possible bridge. This is also a one-time global installation, not a
+per-project setup step.
 
 On POSIX, the default is a symlink. On Windows, it is a copy because symlink privileges are inconsistent.
 Explicit modes are available:
@@ -41,6 +43,23 @@ hermes sdd ui install --force
 hermes sdd ui status
 hermes sdd ui uninstall
 ```
+
+After installing or updating, restart the gateway. Restart the Dashboard process and reload its browser page. In
+Desktop, use the command palette command **Reload desktop plugins** or restart the Desktop app. The SDD sidebar
+entry is `/sdd`; the command palette entry is **Open SDD Project**.
+
+## Per-project initialization
+
+Only the project state is local. From each project directory, initialize `.sdd/` once:
+
+```bash
+cd /path/to/project
+hermes sdd init auto "Describe the project goal"
+```
+
+This does not install the plugin again. It creates the authoritative requirements, roadmap, task, evidence, and
+checkpoint files for that project. Later, use `hermes sdd status`, `/sdd status`, the `sdd` Agent tool, or the
+Dashboard/Desktop **SDD** page without repeating installation.
 
 ## Is a manual clone sufficient?
 
