@@ -8,6 +8,10 @@ permissions:
 
 jobs:
   dependency-review:
+    # GitHub Free does not expose dependency review for private repositories.
+    # Keep the check ready for the eventual public release without failing all
+    # pull requests during the private rollout.
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

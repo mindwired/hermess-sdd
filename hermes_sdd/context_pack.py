@@ -171,7 +171,7 @@ def create_checkpoint(
     )
     files: dict[str, dict[str, Any]] = {}
     for path in _authoritative_files(root, task):
-        rel = str(path.relative_to(root))
+        rel = path.relative_to(root).as_posix()
         files[rel] = {"sha256": sha256_file(path), "size": path.stat().st_size}
     snapshot = {
         "id": checkpoint_id,
@@ -192,7 +192,7 @@ def checkpoint_delta(
         raise ValueError(f"Unknown checkpoint: {checkpoint_id}")
     current: dict[str, dict[str, Any]] = {}
     for path in _authoritative_files(root, task):
-        rel = str(path.relative_to(root))
+        rel = path.relative_to(root).as_posix()
         current[rel] = {"sha256": sha256_file(path), "size": path.stat().st_size}
     old_files = old.get("files", {})
     added = sorted(set(current) - set(old_files))

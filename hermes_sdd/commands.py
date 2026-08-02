@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 from typing import Any, Sequence
 
@@ -61,11 +62,24 @@ def _split_root(tokens: list[str]) -> tuple[list[str], str | None]:
     return cleaned, root
 
 
+def _shell_tokens(raw_args: str) -> list[str]:
+    """Parse slash-command arguments without treating Windows separators as escapes."""
+    tokens = shlex.split(raw_args or "", posix=os.name != "nt")
+    if os.name == "nt":
+        tokens = [
+            token[1:-1]
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}
+            else token
+            for token in tokens
+        ]
+    return tokens
+
+
 def handle_sdd(service: SDDService, raw_args: str) -> str:
     """Handle `/sdd` using small, predictable subcommands."""
 
     try:
-        tokens, root = _split_root(shlex.split(raw_args or ""))
+        tokens, root = _split_root(_shell_tokens(raw_args))
         command = tokens.pop(0).lower() if tokens else "status"
         if command in {"status", "show"}:
             return _status_text(service.execute("status", root=root))

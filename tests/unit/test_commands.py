@@ -10,7 +10,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from hermes_sdd.commands import build_cli_parser, handle_cli, handle_sdd
+from hermes_sdd.commands import _shell_tokens, build_cli_parser, handle_cli, handle_sdd
 from hermes_sdd.core import SDDService
 from hermes_sdd.doctor import run_doctor
 from hermes_sdd.registry import SourceRegistry
@@ -35,6 +35,13 @@ class CommandTest(unittest.TestCase):
         status = handle_sdd(self.service, f"status --root {self.root}")
         self.assertIn("Build a focused service", (self.root / ".sdd" / "project.json").read_text())
         self.assertIn("Mode: `quick`", status)
+
+    def test_slash_init_preserves_windows_root_and_goal(self) -> None:
+        windows_root = r"C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\repo"
+        with patch("hermes_sdd.commands.os.name", "nt"):
+            tokens = _shell_tokens(f'init quick "Build a focused service" --root {windows_root}')
+        self.assertEqual(tokens[0:3], ["init", "quick", "Build a focused service"])
+        self.assertEqual(tokens[4], windows_root)
 
     def test_cli_parser_status_json(self) -> None:
         self.service.execute("init", root=str(self.root), payload={"goal": "CLI", "mode": "quick"})
