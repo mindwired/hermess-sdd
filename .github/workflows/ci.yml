@@ -67,3 +67,5 @@ jobs:
           enable-cache: true
       - name: Ruff lint
         run: uvx --from ruff==0.16.1 ruff check .
+      - name: Ruff format check
+        run: uvx --from ruff==0.16.1 ruff format --check .
