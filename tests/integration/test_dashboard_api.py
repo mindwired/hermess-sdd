@@ -2,17 +2,26 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
 
 
 try:
     from fastapi.testclient import TestClient
-except ImportError:  # pragma: no cover - optional outside Hermes
+except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover - optional outside Hermes
     TestClient = None
+    IMPORT_ERROR = exc
+else:
+    IMPORT_ERROR = None
+
+if TestClient is None and os.getenv("HERMES_REQUIRE_DASHBOARD_TESTS"):
+    raise RuntimeError(f"Dashboard integration dependencies are unavailable: {IMPORT_ERROR}")
 
 
-@unittest.skipIf(TestClient is None, "FastAPI/HTTPX test support is not installed")
 class DashboardApiTest(unittest.TestCase):
+    @unittest.skipIf(
+        TestClient is None, f"FastAPI/HTTPX test support is not installed: {IMPORT_ERROR}"
+    )
     def test_health_source_and_project_lifecycle(self) -> None:
         from fastapi import FastAPI
 
@@ -43,6 +52,9 @@ class DashboardApiTest(unittest.TestCase):
             self.assertEqual(snapshot.status_code, 200)
             self.assertEqual(snapshot.json()["project"]["goal"], "Build it")
 
+    @unittest.skipIf(
+        TestClient is None, f"FastAPI/HTTPX test support is not installed: {IMPORT_ERROR}"
+    )
     def test_rejects_invalid_operation_without_leaking_traceback(self) -> None:
         from fastapi import FastAPI
 

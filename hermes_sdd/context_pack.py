@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import glob
 import json
+import fnmatch
 import subprocess
 import uuid
 from pathlib import Path
@@ -131,8 +132,20 @@ def _scope_files(root: Path, scopes: list[Any], *, limit: int = 2000) -> list[Pa
     return sorted(matched)
 
 
+def _excluded(path: Path, root: Path, patterns: list[Any]) -> bool:
+    relative = path.resolve().relative_to(root.resolve()).as_posix()
+    return any(
+        fnmatch.fnmatch(relative, str(pattern).strip())
+        or fnmatch.fnmatch(path.name, str(pattern).strip())
+        for pattern in patterns
+        if str(pattern).strip()
+    )
+
+
 def _authoritative_files(root: Path, task: dict[str, Any] | None = None) -> list[Path]:
     sdd = root / ".sdd"
+    config = read_json(sdd / "config.json", {}) or {}
+    exclusions = config.get("exclude_patterns", [])
     paths = [
         sdd / "project.json",
         sdd / "config.json",
@@ -142,9 +155,7 @@ def _authoritative_files(root: Path, task: dict[str, Any] | None = None) -> list
         sdd / "architecture.md",
         sdd / "events.jsonl",
     ]
-    paths.extend(
-        sorted((sdd / "decisions").glob("ADR-*.json")) if (sdd / "decisions").exists() else []
-    )
+    paths.extend(sorted((sdd / "decisions").glob("*.json")) if (sdd / "decisions").exists() else [])
     if task:
         milestone_id = str(task.get("milestone_id") or str(task.get("id", "")).split("-T", 1)[0])
         milestone_dir = sdd / "milestones" / milestone_id
@@ -157,8 +168,18 @@ def _authoritative_files(root: Path, task: dict[str, Any] | None = None) -> list
                 milestone_dir / "summary.md",
             ]
         )
-        paths.extend(_scope_files(root, task.get("file_scope", [])))
-    return sorted({path for path in paths if path.exists() and path.is_file()})
+        paths.extend(
+            path
+            for path in _scope_files(root, task.get("file_scope", []))
+            if not _excluded(path, root, exclusions)
+        )
+    return sorted(
+        {
+            path
+            for path in paths
+            if path.exists() and path.is_file() and not _excluded(path, root, exclusions)
+        }
+    )
 
 
 def create_checkpoint(
@@ -340,6 +361,11 @@ def build_context_pack(
         ),
     ]
     text, included = _fit_sections(sections, max(2000, budget_tokens * 4))
+    omitted = [
+        section.splitlines()[0].removeprefix("## ")
+        for _, section in sorted(sections, key=lambda item: item[0])
+        if section and section.splitlines()[0].removeprefix("## ") not in included
+    ]
     return {
         "root": str(root),
         "milestone_id": milestone_id,
@@ -347,5 +373,7 @@ def build_context_pack(
         "budget_tokens": budget_tokens,
         "estimated_tokens": estimate_tokens(text),
         "sections": included,
+        "omitted_sections": omitted,
+        "coverage": {"included": len(included), "omitted": len(omitted)},
         "text": text,
     }

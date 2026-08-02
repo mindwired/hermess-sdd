@@ -71,6 +71,37 @@ def atomic_write_text(path: Path, content: str) -> None:
         tmp.unlink(missing_ok=True)
 
 
+@contextlib.contextmanager
+def project_transaction(sdd_dir: Path) -> Iterator[None]:
+    """Rollback project-local metadata if a multi-file mutation fails.
+
+    The project lock serializes writers, but it cannot undo an evidence append followed by a
+    later state/render failure. This bounded snapshot covers only `.sdd` metadata and excludes
+    the lock/cache implementation directories.
+    """
+    excluded = {sdd_dir / ".locks", sdd_dir / "cache"}
+    snapshot: dict[Path, bytes] = {}
+    for path in sdd_dir.rglob("*"):
+        if not path.is_file() or any(parent in excluded for parent in path.parents):
+            continue
+        snapshot[path] = path.read_bytes()
+    try:
+        yield
+    except Exception:
+        current = [
+            path
+            for path in sdd_dir.rglob("*")
+            if path.is_file() and not any(parent in excluded for parent in path.parents)
+        ]
+        for path in current:
+            if path not in snapshot:
+                path.unlink(missing_ok=True)
+        for path, content in snapshot.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        raise
+
+
 def atomic_write_json(path: Path, value: Any) -> None:
     atomic_write_text(path, json.dumps(value, indent=2, ensure_ascii=False) + "\n")
 

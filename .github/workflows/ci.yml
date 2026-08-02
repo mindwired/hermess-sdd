@@ -54,8 +54,9 @@ jobs:
           enable-cache: true
       - name: Exercise FastAPI adapter against Hermes-compatible dependencies
         run: >-
-          uv run --with fastapi==0.128.2 --with httpx==0.28.1
-          python -m unittest tests.integration.test_dashboard_api -v
+          uv run --isolated --with fastapi==0.128.2 --with httpx==0.28.1
+          --with pydantic==2.12.5 --with pydantic-core==2.41.5
+          env HERMES_REQUIRE_DASHBOARD_TESTS=1 python -m unittest tests.integration.test_dashboard_api -v
 
   lint:
     runs-on: ubuntu-latest

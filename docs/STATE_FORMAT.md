@@ -15,7 +15,7 @@ version.
 
 ### `state.json`
 
-Current project status, active milestone, verified milestone list, blockers, and update timestamp. It is a compact
+Current project status, active milestone, current tasks, last checkpoint, and update timestamp. It is a compact
 resume pointer, not a substitute for reading the active milestone plan.
 
 ### `requirements.json`
@@ -58,6 +58,12 @@ failed/insufficient; it does not automatically satisfy program/high-risk verific
 A checkpoint stores hashes of authoritative `.sdd/` files plus task-scoped source files. Glob patterns are
 expanded to concrete files at checkpoint time. A delta reports added, changed, and removed paths without reading
 unrelated source content into the agent context.
+
+## Context exclusions
+
+`config.json.exclude_patterns` is a project-local list of glob patterns excluded from task-scoped checkpoint
+hashes and context packs. The default excludes common `.env` files. Exclusions are metadata only: the plugin does
+not copy excluded content into `.sdd`.
 
 ## Locking and atomicity
 

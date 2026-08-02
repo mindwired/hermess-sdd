@@ -17,6 +17,7 @@ from .storage import (
     atomic_write_json,
     atomic_write_text,
     project_lock,
+    project_transaction,
     read_json,
     read_jsonl,
     resolve_root,
@@ -28,12 +29,30 @@ _MODES = {"auto", "quick", "standard", "deep", "program"}
 _TASK_STATES = {"pending", "in_progress", "blocked", "done", "skipped"}
 _RISKS = {"low", "medium", "high", "critical"}
 _MILESTONE_STATES = {"planned", "ready", "in_progress", "blocked", "done", "verified", "cancelled"}
+_REQUIREMENT_PRIORITIES = {"must", "should", "could", "wont"}
+_REQUIREMENT_STATES = {"active", "satisfied", "deferred", "cancelled"}
+_DECISION_STATES = {"proposed", "accepted", "superseded", "rejected"}
+_DECISION_ID_RE = re.compile(r"^ADR-\d{4,}$")
 
 
 def _list(value: Any) -> list[Any]:
     if value is None:
         return []
     return value if isinstance(value, list) else [value]
+
+
+def _string_list(value: Any, label: str) -> list[str]:
+    values = _list(value)
+    if any(not isinstance(item, str) or not item.strip() for item in values):
+        raise ValueError(f"{label} must contain non-empty strings")
+    return [item.strip() for item in values]
+
+
+def _decision_id(value: Any) -> str:
+    decision_id = validate_id(value, "decision id")
+    if not _DECISION_ID_RE.fullmatch(decision_id):
+        raise ValueError("Decision id must use the ADR-0001 format")
+    return decision_id
 
 
 def _compact(value: Any) -> Any:
@@ -207,6 +226,10 @@ class SDDService:
             "require_evidence": evidence_policy,
             "strict": bool(payload.get("strict", False)),
             "include_git_summary": bool(payload.get("include_git_summary", True)),
+            "exclude_patterns": _string_list(
+                payload.get("exclude_patterns", [".env", ".env.*", "**/.env", "**/.env.*"]),
+                "exclude patterns",
+            ),
             "max_artifact_chars": max(8000, int(payload.get("max_artifact_chars") or 50000)),
         }
         state = {
@@ -256,6 +279,7 @@ class SDDService:
             "strict",
             "include_git_summary",
             "max_artifact_chars",
+            "exclude_patterns",
         }
         updates = {key: value for key, value in payload.items() if key in allowed}
         if "mode" in updates and updates["mode"] not in _MODES - {"auto"}:
@@ -272,7 +296,11 @@ class SDDService:
             "always",
         }:
             raise ValueError("require_evidence must be never, risk_based, or always")
-        with project_lock(sdd):
+        if "exclude_patterns" in updates:
+            updates["exclude_patterns"] = _string_list(
+                updates["exclude_patterns"], "exclude patterns"
+            )
+        with project_lock(sdd), project_transaction(sdd):
             config = read_json(sdd / "config.json", {}) or {}
             config.update(updates)
             config["updated_at"] = utc_now()
@@ -291,7 +319,7 @@ class SDDService:
     ) -> dict[str, Any]:
         project_root = self._root(root)
         sdd = self._require(project_root)
-        with project_lock(sdd):
+        with project_lock(sdd), project_transaction(sdd):
             project = read_json(sdd / "project.json", {}) or {}
             for key in (
                 "name",
@@ -324,14 +352,25 @@ class SDDService:
                 req_id = raw.get("id") or _next_numeric_id(existing_ids, "REQ-", 3)
                 req_id = validate_id(req_id, "requirement id")
                 item = existing.get(req_id, {"id": req_id, "created_at": utc_now()})
+                priority = raw.get("priority", item.get("priority", "must"))
+                status = raw.get("status", item.get("status", "active"))
+                if priority not in _REQUIREMENT_PRIORITIES:
+                    raise ValueError(f"Invalid requirement priority: {priority}")
+                if status not in _REQUIREMENT_STATES:
+                    raise ValueError(f"Invalid requirement status: {status}")
                 item.update(
                     {
-                        "title": raw.get("title") or item.get("title") or req_id,
-                        "statement": raw.get("statement") or item.get("statement") or "",
-                        "priority": raw.get("priority") or item.get("priority") or "must",
-                        "acceptance": _list(raw.get("acceptance", item.get("acceptance", []))),
-                        "status": raw.get("status") or item.get("status") or "active",
-                        "source": raw.get("source") or item.get("source") or "user",
+                        "title": raw["title"] if "title" in raw else item.get("title") or req_id,
+                        "statement": raw["statement"]
+                        if "statement" in raw
+                        else item.get("statement", ""),
+                        "priority": priority,
+                        "acceptance": _string_list(
+                            raw.get("acceptance", item.get("acceptance", [])),
+                            "requirement acceptance",
+                        ),
+                        "status": status,
+                        "source": raw["source"] if "source" in raw else item.get("source", "user"),
                         "updated_at": utc_now(),
                     }
                 )
@@ -360,7 +399,7 @@ class SDDService:
     ) -> dict[str, Any]:
         project_root = self._root(root)
         sdd = self._require(project_root)
-        with project_lock(sdd):
+        with project_lock(sdd), project_transaction(sdd):
             roadmap = read_json(sdd / "roadmap.json", {"milestones": []}) or {"milestones": []}
             milestones = roadmap.get("milestones", [])
             milestone_id = validate_id(
@@ -373,15 +412,18 @@ class SDDService:
             milestone_status = payload.get("status") or "planned"
             if milestone_status not in _MILESTONE_STATES:
                 raise ValueError(f"Invalid milestone status: {milestone_status}")
+            risk = payload.get("risk", "medium")
+            if risk not in _RISKS:
+                raise ValueError(f"Invalid milestone risk: {risk}")
             milestone = {
                 "id": milestone_id,
                 "title": payload.get("title") or milestone_id,
                 "objective": payload.get("objective") or "",
                 "status": milestone_status,
-                "risk": payload.get("risk") if payload.get("risk") in _RISKS else "medium",
-                "requirement_ids": _list(payload.get("requirement_ids")),
-                "decision_ids": _list(payload.get("decision_ids")),
-                "exit_criteria": _list(payload.get("exit_criteria")),
+                "risk": risk,
+                "requirement_ids": _string_list(payload.get("requirement_ids"), "requirement ids"),
+                "decision_ids": [_decision_id(item) for item in _list(payload.get("decision_ids"))],
+                "exit_criteria": _string_list(payload.get("exit_criteria"), "exit criteria"),
                 "interfaces_stable": bool(payload.get("interfaces_stable", False)),
                 "created_at": utc_now(),
                 "updated_at": utc_now(),
@@ -427,7 +469,7 @@ class SDDService:
         sdd = self._require(project_root)
         scalar_fields = {"title", "objective", "status", "risk", "interfaces_stable"}
         list_fields = {"requirement_ids", "decision_ids", "exit_criteria"}
-        with project_lock(sdd):
+        with project_lock(sdd), project_transaction(sdd):
             milestone_id, milestone_dir, milestone, _ = self._milestone(
                 sdd, target or payload.get("milestone_id")
             )
@@ -441,7 +483,12 @@ class SDDService:
                     milestone[key] = bool(value) if key == "interfaces_stable" else value
             for key in list_fields:
                 if key in payload:
-                    milestone[key] = _list(payload[key])
+                    if key == "decision_ids":
+                        milestone[key] = [_decision_id(item) for item in _list(payload[key])]
+                    elif key == "requirement_ids":
+                        milestone[key] = _string_list(payload[key], "requirement ids")
+                    else:
+                        milestone[key] = _string_list(payload[key], "exit criteria")
             milestone["updated_at"] = utc_now()
             atomic_write_json(milestone_dir / "milestone.json", milestone)
             if "context" in payload:
@@ -485,7 +532,7 @@ class SDDService:
         raw_tasks = _list(payload.get("tasks"))
         if not raw_tasks:
             raise ValueError("set_plan requires payload.tasks")
-        with project_lock(sdd):
+        with project_lock(sdd), project_transaction(sdd):
             milestone_id, milestone_dir, milestone, old_plan = self._milestone(
                 sdd, payload.get("milestone_id")
             )
@@ -506,21 +553,36 @@ class SDDService:
                     raise ValueError(f"Duplicate task id: {task_id}")
                 ids.append(task_id)
                 previous = existing_by_id.get(task_id, {})
-                status = raw.get("status") or previous.get("status") or "pending"
+                status = raw["status"] if "status" in raw else previous.get("status", "pending")
                 if status not in _TASK_STATES:
                     raise ValueError(f"Invalid status for {task_id}: {status}")
-                risk = raw.get("risk") or previous.get("risk") or "medium"
+                if (
+                    status != "pending"
+                    and task_id not in existing_by_id
+                    and not options.get("reconcile")
+                ):
+                    raise ValueError(
+                        f"Task {task_id} has status {status}; set_plan only creates pending tasks "
+                        "unless options.reconcile is used"
+                    )
+                risk = raw["risk"] if "risk" in raw else previous.get("risk", "medium")
                 if risk not in _RISKS:
-                    risk = "medium"
+                    raise ValueError(f"Invalid task risk: {risk}")
                 task = {
                     "id": task_id,
                     "milestone_id": milestone_id,
-                    "title": raw.get("title") or previous.get("title") or task_id,
-                    "objective": raw.get("objective") or previous.get("objective") or "",
+                    "title": raw["title"] if "title" in raw else previous.get("title") or task_id,
+                    "objective": raw["objective"]
+                    if "objective" in raw
+                    else previous.get("objective", ""),
                     "status": status,
-                    "priority": raw.get("priority") or previous.get("priority") or "normal",
+                    "priority": raw["priority"]
+                    if "priority" in raw
+                    else previous.get("priority", "normal"),
                     "risk": risk,
-                    "kind": raw.get("kind") or previous.get("kind") or "implementation",
+                    "kind": raw["kind"]
+                    if "kind" in raw
+                    else previous.get("kind", "implementation"),
                     "depends_on": _list(raw.get("depends_on", previous.get("depends_on", []))),
                     "acceptance": _list(raw.get("acceptance", previous.get("acceptance", []))),
                     "file_scope": _list(raw.get("file_scope", previous.get("file_scope", []))),
@@ -530,9 +592,11 @@ class SDDService:
                     "decision_ids": _list(
                         raw.get("decision_ids", previous.get("decision_ids", []))
                     ),
-                    "agent_role": raw.get("agent_role") or previous.get("agent_role") or "builder",
-                    "notes": raw.get("notes") or previous.get("notes") or "",
-                    "summary": previous.get("summary") or "",
+                    "agent_role": raw["agent_role"]
+                    if "agent_role" in raw
+                    else previous.get("agent_role", "builder"),
+                    "notes": raw["notes"] if "notes" in raw else previous.get("notes", ""),
+                    "summary": raw["summary"] if "summary" in raw else previous.get("summary", ""),
                     "evidence_ids": previous.get("evidence_ids", []),
                     "created_at": previous.get("created_at") or utc_now(),
                     "updated_at": utc_now(),
@@ -583,10 +647,13 @@ class SDDService:
     @staticmethod
     def _sync_roadmap_milestone(sdd: Path, milestone: dict[str, Any]) -> None:
         roadmap = read_json(sdd / "roadmap.json", {"milestones": []}) or {"milestones": []}
-        roadmap["milestones"] = [
+        rows = [
             milestone if item.get("id") == milestone.get("id") else item
             for item in roadmap.get("milestones", [])
         ]
+        if not any(item.get("id") == milestone.get("id") for item in rows):
+            rows.append(milestone)
+        roadmap["milestones"] = rows
         atomic_write_json(sdd / "roadmap.json", roadmap)
 
     @staticmethod
@@ -706,7 +773,7 @@ class SDDService:
             "summary",
         }
         list_fields = {"depends_on", "acceptance", "file_scope", "requirement_ids", "decision_ids"}
-        with project_lock(sdd):
+        with project_lock(sdd), project_transaction(sdd):
             if payload.get("milestone_id"):
                 milestone_id, milestone_dir, _, plan = self._milestone(
                     sdd, payload.get("milestone_id")
@@ -794,7 +861,7 @@ class SDDService:
             "done": {"in_progress"},
             "skipped": {"pending"},
         }
-        with project_lock(sdd):
+        with project_lock(sdd), project_transaction(sdd):
             if payload.get("milestone_id"):
                 milestone_id, milestone_dir, milestone, plan = self._milestone(
                     sdd, payload.get("milestone_id")
@@ -812,6 +879,10 @@ class SDDService:
             old_status = task.get("status", "pending")
             if new_status != old_status and new_status not in allowed.get(old_status, set()):
                 raise ValueError(f"Invalid transition {old_status} -> {new_status} for {task_id}")
+            if payload.get("evidence"):
+                if not isinstance(payload["evidence"], dict):
+                    raise ValueError("Evidence must be an object")
+                self._validate_evidence_payload(task, payload["evidence"], task_id=task_id)
             state = read_json(sdd / "state.json", {}) or {}
             if (
                 new_status == "in_progress"
@@ -878,6 +949,10 @@ class SDDService:
             state["current_tasks"] = sorted(current)
             state["updated_at"] = utc_now()
             if payload.get("evidence"):
+                if payload["evidence"].get("task_id") not in (None, task_id):
+                    raise ValueError(
+                        f"Evidence task_id {payload['evidence'].get('task_id')} does not match target {task_id}"
+                    )
                 evidence = self._record_evidence_locked(
                     project_root, sdd, milestone_dir, task, payload["evidence"]
                 )
@@ -931,6 +1006,7 @@ class SDDService:
         task: dict[str, Any] | None,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        self._validate_evidence_payload(task, payload, task_id=task.get("id") if task else None)
         existing = read_jsonl(milestone_dir / "evidence.jsonl")
         evidence_id = payload.get("id") or _next_numeric_id(
             [item.get("id", "") for item in existing], "E", 6
@@ -941,15 +1017,7 @@ class SDDService:
             (result_text, payload.get("command"), payload.get("artifact"), payload.get("details"))
         ):
             raise ValueError("Evidence requires a result, command, artifact, or details")
-        passed = payload.get("passed")
-        if passed is None:
-            lowered = result_text.lower()
-            if any(
-                word in lowered for word in ("fail", "error", "broken", "blocked", "regression")
-            ):
-                passed = False
-            elif any(word in lowered for word in ("pass", "success", "verified", "complete", "ok")):
-                passed = True
+        passed = payload["passed"] if "passed" in payload else None
         evidence = {
             "id": evidence_id,
             "at": utc_now(),
@@ -978,6 +1046,22 @@ class SDDService:
         )
         return evidence
 
+    @staticmethod
+    def _validate_evidence_payload(
+        task: dict[str, Any] | None, payload: dict[str, Any], *, task_id: str | None
+    ) -> None:
+        supplied_task_id = payload.get("task_id")
+        if supplied_task_id not in (None, task_id):
+            raise ValueError(f"Evidence task_id {supplied_task_id} does not match target {task_id}")
+        if not any(
+            str(payload.get(key) or "").strip()
+            for key in ("result", "command", "artifact", "details")
+        ):
+            raise ValueError("Evidence requires a result, command, artifact, or details")
+        passed = payload.get("passed")
+        if passed is not None and not isinstance(passed, bool):
+            raise ValueError("Evidence passed must be true, false, or omitted")
+
     def record_evidence(
         self, root: str | None, target: str | None, payload: dict[str, Any], options: dict[str, Any]
     ) -> dict[str, Any]:
@@ -986,7 +1070,7 @@ class SDDService:
         task_id = target or payload.get("task_id")
         if task_id:
             task_id = validate_id(task_id, "task id")
-        with project_lock(sdd):
+        with project_lock(sdd), project_transaction(sdd):
             if task_id:
                 if payload.get("milestone_id"):
                     milestone_id, milestone_dir, _, plan = self._milestone(
@@ -1025,7 +1109,7 @@ class SDDService:
         project_root = self._root(root)
         sdd = self._require(project_root)
         summary = str(payload.get("summary") or "Milestone completed and verified.").strip()
-        with project_lock(sdd):
+        with project_lock(sdd), project_transaction(sdd):
             milestone_id, milestone_dir, milestone, plan = self._milestone(
                 sdd, target or payload.get("milestone_id")
             )
@@ -1132,10 +1216,10 @@ class SDDService:
     ) -> dict[str, Any]:
         project_root = self._root(root)
         sdd = self._require(project_root)
-        with project_lock(sdd):
+        with project_lock(sdd), project_transaction(sdd):
             existing = [path.stem for path in (sdd / "decisions").glob("ADR-*.json")]
-            decision_id = validate_id(
-                target or payload.get("id") or _next_numeric_id(existing, "ADR-", 4), "decision id"
+            decision_id = _decision_id(
+                target or payload.get("id") or _next_numeric_id(existing, "ADR-", 4)
             )
             previous = read_json(sdd / "decisions" / f"{decision_id}.json", {}) or {}
             decision = {
@@ -1160,6 +1244,8 @@ class SDDService:
                 "created_at": previous.get("created_at") or payload.get("created_at") or utc_now(),
                 "updated_at": utc_now(),
             }
+            if decision["status"] not in _DECISION_STATES:
+                raise ValueError(f"Invalid decision status: {decision['status']}")
             atomic_write_json(sdd / "decisions" / f"{decision_id}.json", decision)
             self._event(
                 sdd, "decision_recorded", decision_id=decision_id, title=decision.get("title")
@@ -1198,7 +1284,7 @@ class SDDService:
         task = None
         if payload.get("task_id"):
             _, _, _, _, task = self._locate_task(sdd, validate_id(payload["task_id"], "task id"))
-        with project_lock(sdd):
+        with project_lock(sdd), project_transaction(sdd):
             snapshot = create_checkpoint(project_root, target or payload.get("id"), task)
             state = read_json(sdd / "state.json", {}) or {}
             state["last_checkpoint"] = snapshot["id"]
@@ -1240,7 +1326,7 @@ class SDDService:
         roadmap = read_json(sdd / "roadmap.json", {"milestones": []}) or {"milestones": []}
         requirement_rows = requirements.get("requirements", [])
         req_ids = {item.get("id") for item in requirement_rows if item.get("id")}
-        decision_ids = {path.stem for path in (sdd / "decisions").glob("ADR-*.json")}
+        decision_ids = {path.stem for path in (sdd / "decisions").glob("*.json")}
         milestone_rows = roadmap.get("milestones", [])
         milestone_ids = {item.get("id") for item in milestone_rows if item.get("id")}
         findings: list[dict[str, Any]] = []
@@ -1456,7 +1542,12 @@ class SDDService:
                     message = "Completed task has no successful evidence"
                     if evidence_by_task.get(task_id):
                         message += " (recorded evidence is failed or unclassified)"
-                    add("warning", "task.evidence_missing", message, task_id)
+                    add(
+                        "error" if task.get("risk") in {"high", "critical"} else "warning",
+                        "task.evidence_missing",
+                        message,
+                        task_id,
+                    )
                 if task.get("status") == "blocked" and not task.get("blocked_reason"):
                     add(
                         "warning",
@@ -1497,6 +1588,19 @@ class SDDService:
                     task_id,
                 )
 
+        status_counts = Counter(item.get("status", "planned") for item in milestone_rows)
+        task_status_counts = Counter(task.get("status", "pending") for task in all_tasks.values())
+        for req in requirement_rows:
+            req_id = str(req.get("id") or "")
+            if req_id and req.get("status", "active") == "active":
+                linked_tasks = [
+                    task for task in all_tasks.values() if req_id in task.get("requirement_ids", [])
+                ]
+                if not linked_tasks:
+                    add(
+                        "warning", "requirement.uncovered", "Requirement has no linked task", req_id
+                    )
+
         max_chars = int(config.get("max_artifact_chars") or 50000)
         for path in sdd.rglob("*"):
             if (
@@ -1518,6 +1622,8 @@ class SDDService:
             "score": score,
             "counts": dict(severity_counts),
             "findings": findings if options.get("detail", "normal") != "compact" else findings[:10],
+            "milestone_status_counts": dict(status_counts),
+            "task_status_counts": dict(task_status_counts),
         }
         if payload.get("record", True):
             self._event(sdd, "validation_completed", score=score, counts=dict(severity_counts))

@@ -5,7 +5,7 @@ Date: **August 1, 2026**
 ## Completed locally
 
 - `uv lock --offline` and `uv sync --locked --offline` with Python 3.13.5.
-- 23 standard-library unit/integration tests with `ResourceWarning` promoted to an error.
+- Standard-library unit/integration tests (the count changes as regression coverage evolves).
 - FastAPI Dashboard integration test with FastAPI 0.128.2 and HTTPX 0.28.1.
 - Python AST parsing and isolated bytecode compilation for every Python file.
 - JSON parsing for every committed JSON file.
@@ -37,6 +37,10 @@ the artifact runtime because its Python package registry has no network access o
 the authoritative Ruff execution and is intentionally required before merging or releasing.
 
 ## Remaining deployment validation
+
+Dashboard integration tests must execute in CI with FastAPI, HTTPX, and a compatible Pydantic wheel; a skipped
+optional test is not evidence of adapter coverage. Local environments without those wheels should report the
+environment blocker explicitly rather than claim the dashboard path passed.
 
 The repository environment includes Hermes Agent `0.19.1`; local validation must still include a disposable-profile
 plugin installation and CLI smoke test. Graphical Dashboard/Desktop interaction remains a manual gate because this

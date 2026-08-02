@@ -165,7 +165,7 @@ The five bundled skills add procedural guidance only when relevant:
 │       ├── plan.json
 │       ├── PLAN.md
 │       └── summary.md
-├── evidence/
+├── milestones/<id>/evidence.jsonl
 ├── checkpoints/
 ├── validations/
 └── events.jsonl
@@ -212,9 +212,10 @@ The script symlinks this checkout into both Hermes plugin locations on POSIX so 
 
 ## Status
 
-`0.1.0` is an implementation-complete alpha. The state model, scheduler, locking, context packs, Agent surface,
-and UI adapters are tested. Before broad distribution, smoke-test the graphical adapters against the exact Hermes
-release you deploy. The repository is published at [mindwired/hermess-sdd](https://github.com/mindwired/hermess-sdd).
+`0.1.0` is an alpha with project-local state, bounded context packs, evidence gates, and UI adapters. Optional
+Dashboard dependencies and graphical adapters remain deployment gates; skipped integration tests are not treated as
+coverage. Before broad distribution, smoke-test the graphical adapters against the exact Hermes release you deploy.
+The repository is published at [mindwired/hermess-sdd](https://github.com/mindwired/hermess-sdd).
 
 ## License
 
